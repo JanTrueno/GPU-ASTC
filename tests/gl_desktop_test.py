@@ -31,7 +31,6 @@ def gpu_encode(ctx, rgba, block, alpha):
     return buf.read()
 
 def decode(data, w, h, block):
-    cfg = ae.ASTCConfig(ae.ASTCProfile.LDR, block, block, 1, 60.0, ae.ASTCConfigFlags(0)) if False else None
     cfg = ae.ASTCConfig(ae.ASTCProfile.LDR, block, block, 1, ae.ASTCQualityPreset.MEDIUM)
     actx = ae.ASTCContext(cfg)
     out = ae.ASTCImage(ae.ASTCType.U8, w, h, 1)

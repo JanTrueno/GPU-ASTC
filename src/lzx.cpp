@@ -25,11 +25,9 @@ struct Huff {
     uint16_t sorted[kMainElements]; // symbols ordered by (length, symbol)
     int first_code[kMaxBits + 2];
     int first_index[kMaxBits + 2];
-    int n = 0;
 
     bool build(const uint8_t* lens, int num)
     {
-        n = num;
         std::memset(count, 0, sizeof(count));
         for (int i = 0; i < num; ++i) ++count[lens[i]];
         count[0] = 0;

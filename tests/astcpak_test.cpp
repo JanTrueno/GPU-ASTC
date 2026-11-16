@@ -20,7 +20,7 @@ int main(int argc, char** argv)
     astcpak pak;
     if (!astcpak_open(&pak, file.data(), file.size())) { std::printf("FAIL: not a valid archive\n"); return 1; }
 
-    int bad = 0, shared = 0;
+    int bad = 0;
     std::string prev;
     for (uint32_t i = 0; i < pak.count; ++i) {
         astcpak_entry e;
@@ -64,6 +64,5 @@ int main(int argc, char** argv)
 
     std::printf("%u entries checked, %d problems (options in header: block %u, alpha %u, normal %u)\n",
                 pak.count, bad, pak.opt_block, pak.opt_alpha, pak.opt_normal);
-    (void)shared;
     return bad ? 1 : 0;
 }

@@ -1,6 +1,6 @@
 // PNG loading for gpuastc.
 //
-// decode_png() uses a fast libdeflate-based decoder when the project is built with
+// decode_png_memory() uses a fast libdeflate-based decoder when the project is built with
 // libdeflate (GPUASTC_HAVE_LIBDEFLATE) and falls back to stb_image for everything else
 // (interlaced files, unusual headers, or when libdeflate is not available).
 #pragma once
@@ -22,9 +22,6 @@ struct Image {
 bool read_file(const char* path, std::vector<uint8_t>& out);
 
 // Any PNG -> RGBA8 (grey, grey+alpha, RGB, RGBA, palette, 1-16 bit, tRNS).
-bool decode_png(const char* path, Image& out, std::string* err = nullptr);
-
-// Same as decode_png() for a file that is already in memory.
 bool decode_png_memory(const std::vector<uint8_t>& file, Image& out, std::string* err = nullptr);
 
 // The two back ends, exposed so tests can compare them.
