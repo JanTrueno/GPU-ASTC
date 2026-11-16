@@ -1,32 +1,171 @@
-// gpuastc: encode a PNG to .astc using a GLES 3.1 compute shader.
+// gpuastc: encode PNG files to .astc with a GLES 3.1 compute shader.
+//
+//   gpuastc in.png out.astc [options]            one file
+//   gpuastc -batch in_dir out_dir [options]      every .png in a directory
+//
+// Batch mode keeps one GL context and shader, decodes PNGs on worker threads, and packs
+// many small images into one tall texture so they are encoded in a single dispatch.
 // The GLES context comes from SDL2, so it works on KMSDRM/offscreen with no window system.
 #include "astc_gles.h"
+#include "png_decode.h"
 
 #include <SDL.h>
 
-#define STB_IMAGE_IMPLEMENTATION
-#define STBI_ONLY_PNG
-#include "stb_image.h"
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <tuple>
+#include <utility>
 #include <vector>
 
-static void usage()
+namespace {
+
+double now_ms()
+{
+    using namespace std::chrono;
+    return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
+}
+
+void usage()
 {
     std::fprintf(stderr,
         "usage: gpuastc input.png output.astc [options]\n"
+        "       gpuastc -batch input_dir output_dir [options]\n"
         "  -b auto|4|5|6     block size (default auto: 4x4 up to 256x256, thin or alpha textures;\n"
         "                    5x5 up to 2048x2048; 6x6 above)\n"
         "  -alpha auto|on|off  encode alpha (default auto: on if any alpha < 255)\n"
         "  -norm             normal map (B and A forced to 1)\n"
+        "  -j N              decoder threads in batch mode (default: cores - 1)\n"
         "  -upload           also upload the result into an ASTC texture on the GPU (self-test)\n"
         "  -v                verbose\n");
 }
 
-static bool has_extension(const char* name)
+struct Cli {
+    int block = 0;      // 0 = auto
+    int alpha_mode = 0; // 0 auto, 1 on, 2 off
+    bool normal = false;
+    bool upload = false;
+    bool verbose = false;
+    int threads = 0;
+    bool batch = false;
+    std::string in, out;
+};
+
+// ---------------------------------------------------------------------------
+// files
+// ---------------------------------------------------------------------------
+
+bool write_astc(const std::string& path, int bdim, int w, int h, const uint8_t* data, size_t size)
+{
+    uint8_t hdr[16] = {0x13, 0xAB, 0xA1, 0x5C, (uint8_t)bdim, (uint8_t)bdim, 1,
+                       (uint8_t)w, (uint8_t)(w >> 8), (uint8_t)(w >> 16),
+                       (uint8_t)h, (uint8_t)(h >> 8), (uint8_t)(h >> 16), 1, 0, 0};
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    bool ok = std::fwrite(hdr, 1, sizeof(hdr), f) == sizeof(hdr) && std::fwrite(data, 1, size, f) == size;
+    std::fclose(f);
+    return ok;
+}
+
+bool ends_with_png(const std::string& s)
+{
+    if (s.size() < 4) return false;
+    std::string e = s.substr(s.size() - 4);
+    for (char& c : e) c = (char)std::tolower((unsigned char)c);
+    return e == ".png";
+}
+
+typedef std::vector<std::pair<std::string, std::string>> FileList; // (input path, output path)
+
+bool list_directory(const std::string& in_dir, const std::string& out_dir, FileList& files)
+{
+    DIR* d = opendir(in_dir.c_str());
+    if (!d) return false;
+    std::vector<std::string> names;
+    while (dirent* e = readdir(d)) {
+        std::string n = e->d_name;
+        if (ends_with_png(n)) names.push_back(n);
+    }
+    closedir(d);
+    std::sort(names.begin(), names.end());
+    for (const std::string& n : names)
+        files.push_back(std::make_pair(in_dir + "/" + n, out_dir + "/" + n.substr(0, n.size() - 4) + ".astc"));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// decoded images flow from worker threads to the GL thread through a bounded queue
+// ---------------------------------------------------------------------------
+
+struct Job {
+    std::string out_path;
+    gpuastc::Image img;
+    int block = 4;
+    bool alpha = false;
+};
+
+class JobQueue {
+public:
+    explicit JobQueue(size_t max_bytes) : max_bytes_(max_bytes) {}
+
+    void push(Job&& j)
+    {
+        std::unique_lock<std::mutex> lk(m_);
+        const size_t sz = j.img.rgba.size();
+        not_full_.wait(lk, [&] { return bytes_ == 0 || bytes_ + sz <= max_bytes_; });
+        bytes_ += sz;
+        q_.push_back(std::move(j));
+        not_empty_.notify_one();
+    }
+
+    bool pop(Job& j)
+    {
+        std::unique_lock<std::mutex> lk(m_);
+        not_empty_.wait(lk, [&] { return !q_.empty() || closed_; });
+        if (q_.empty()) return false;
+        j = std::move(q_.front());
+        q_.pop_front();
+        bytes_ -= j.img.rgba.size();
+        not_full_.notify_all();
+        return true;
+    }
+
+    void close()
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        closed_ = true;
+        not_empty_.notify_all();
+    }
+
+private:
+    std::mutex m_;
+    std::condition_variable not_empty_, not_full_;
+    std::deque<Job> q_;
+    size_t bytes_ = 0;
+    const size_t max_bytes_;
+    bool closed_ = false;
+};
+
+// ---------------------------------------------------------------------------
+// GL side
+// ---------------------------------------------------------------------------
+
+bool has_extension(const char* name)
 {
     GLint n = 0;
     glGetIntegerv(GL_NUM_EXTENSIONS, &n);
@@ -38,60 +177,228 @@ static bool has_extension(const char* name)
     return false;
 }
 
-static bool save_astc(const char* path, int bdim, int w, int h, const void* data, size_t size)
+struct Gpu {
+    std::map<std::pair<int, int>, std::unique_ptr<gpuastc::Encoder>> encoders; // (block, alpha)
+    GLuint tex = 0, buf = 0;
+    int max_height = 4096; // tallest atlas we build
+    int max_tex = 2048;
+    bool normal = false, upload = false, verbose = false;
+
+    // statistics
+    double ms_gpu = 0, ms_write = 0;
+    long long pixels = 0, bytes_out = 0;
+    int files_ok = 0, files_failed = 0, dispatches = 0;
+
+    gpuastc::Encoder* encoder(int block, bool alpha)
+    {
+        auto key = std::make_pair(block, alpha ? 1 : 0);
+        auto it = encoders.find(key);
+        if (it != encoders.end()) return it->second.get();
+        std::unique_ptr<gpuastc::Encoder> e(new gpuastc::Encoder());
+        gpuastc::Options o;
+        o.block = block;
+        o.alpha = alpha;
+        o.normal_map = normal;
+        std::string log;
+        if (!e->create(o, &log)) {
+            std::fprintf(stderr, "shader error (%dx%d, alpha %d):\n%s\n", block, block, alpha ? 1 : 0, log.c_str());
+            return nullptr;
+        }
+        gpuastc::Encoder* raw = e.get();
+        encoders[key] = std::move(e);
+        return raw;
+    }
+};
+
+// A set of images that are encoded together. All images in a pack share block size, alpha
+// mode and padded width, and are stacked vertically (each padded to whole blocks), so every
+// image's blocks form one contiguous slab of the output.
+struct Pack {
+    int block = 4;
+    bool alpha = false;
+    int width = 0;  // padded width
+    int height = 0; // total padded height
+    long long pixels = 0;
+    std::vector<Job> jobs;
+    std::vector<int> row0; // first padded row of each job
+
+    static int pad(int v, int block) { return (v + block - 1) / block * block; }
+    void clear()
+    {
+        jobs.clear();
+        row0.clear();
+        height = 0;
+        pixels = 0;
+    }
+    void add(Job&& j)
+    {
+        row0.push_back(height);
+        height += pad(j.img.h, block);
+        pixels += (long long)j.img.w * j.img.h;
+        jobs.push_back(std::move(j));
+    }
+};
+
+bool flush_pack(Gpu& g, Pack& p)
 {
-    uint8_t hdr[16] = {0x13, 0xAB, 0xA1, 0x5C, (uint8_t)bdim, (uint8_t)bdim, 1,
-                       (uint8_t)w, (uint8_t)(w >> 8), (uint8_t)(w >> 16),
-                       (uint8_t)h, (uint8_t)(h >> 8), (uint8_t)(h >> 16), 1, 0, 0};
-    FILE* f = std::fopen(path, "wb");
-    if (!f) return false;
-    bool ok = std::fwrite(hdr, 1, sizeof(hdr), f) == sizeof(hdr) &&
-              std::fwrite(data, 1, size, f) == size;
-    std::fclose(f);
-    return ok;
+    if (p.jobs.empty()) return true;
+
+    const int block = p.block;
+    gpuastc::Encoder* enc = g.encoder(block, p.alpha);
+    if (!enc) { g.files_failed += (int)p.jobs.size(); p.clear(); return false; }
+
+    const bool single = p.jobs.size() == 1;
+    int W = 0, H = 0;
+    const uint8_t* data = nullptr;
+    std::vector<uint8_t> atlas;
+    if (single) {
+        W = p.jobs[0].img.w;
+        H = p.jobs[0].img.h;
+        data = p.jobs[0].img.rgba.data();
+    } else {
+        W = p.width;
+        H = p.height;
+        atlas.assign((size_t)W * H * 4, 0);
+        for (size_t k = 0; k < p.jobs.size(); ++k) {
+            const gpuastc::Image& im = p.jobs[k].img;
+            const int ph = Pack::pad(im.h, block);
+            for (int y = 0; y < ph; ++y) {
+                const uint8_t* src = &im.rgba[(size_t)std::min(y, im.h - 1) * im.w * 4];
+                uint8_t* dst = &atlas[((size_t)(p.row0[k] + y) * W) * 4];
+                std::memcpy(dst, src, (size_t)im.w * 4);
+                for (int x = im.w; x < W; ++x) // replicate the last pixel into the padding
+                    std::memcpy(dst + (size_t)x * 4, src + (size_t)(im.w - 1) * 4, 4);
+            }
+        }
+        data = atlas.data();
+    }
+    if (W > g.max_tex || H > g.max_tex) {
+        std::fprintf(stderr, "%s: %dx%d exceeds GL_MAX_TEXTURE_SIZE (%d)\n", p.jobs[0].out_path.c_str(), W, H, g.max_tex);
+        g.files_failed += (int)p.jobs.size();
+        p.clear();
+        return false;
+    }
+
+    const double t0 = now_ms();
+    glBindTexture(GL_TEXTURE_2D, g.tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+    if (!enc->encode(g.tex, W, H, g.buf)) {
+        std::fprintf(stderr, "dispatch failed (GL error 0x%x)\n", glGetError());
+        g.files_failed += (int)p.jobs.size();
+        p.clear();
+        return false;
+    }
+
+    const int bx = gpuastc::Encoder::blocks(W, block), by = gpuastc::Encoder::blocks(H, block);
+    const size_t total = (size_t)bx * by * 16;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g.buf);
+    const uint8_t* mapped = (const uint8_t*)glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)total, GL_MAP_READ_BIT);
+    if (!mapped) {
+        std::fprintf(stderr, "map failed (GL error 0x%x)\n", glGetError());
+        g.files_failed += (int)p.jobs.size();
+        p.clear();
+        return false;
+    }
+    const double t1 = now_ms();
+    g.ms_gpu += t1 - t0;
+    ++g.dispatches;
+
+    for (size_t k = 0; k < p.jobs.size(); ++k) {
+        const Job& j = p.jobs[k];
+        const size_t first = single ? 0 : (size_t)(p.row0[k] / block) * bx * 16;
+        const size_t size = (size_t)gpuastc::Encoder::blocks(j.img.h, block) * bx * 16;
+        if (write_astc(j.out_path, block, j.img.w, j.img.h, mapped + first, size)) {
+            ++g.files_ok;
+            g.pixels += (long long)j.img.w * j.img.h;
+            g.bytes_out += (long long)size + 16;
+            if (g.verbose && p.jobs.size() == 1)
+                std::printf("%s: %dx%d -> %dx%d blocks of %dx%d\n", j.out_path.c_str(), j.img.w, j.img.h, bx, by, block, block);
+        } else {
+            std::fprintf(stderr, "cannot write %s\n", j.out_path.c_str());
+            ++g.files_failed;
+        }
+    }
+    g.ms_write += now_ms() - t1;
+    glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+
+    if (g.upload && single) {
+        // Zero-copy path for real use: SSBO -> PBO unpack -> ASTC texture.
+        if (!has_extension("GL_KHR_texture_compression_astc_ldr")) {
+            std::fprintf(stderr, "upload: GL_KHR_texture_compression_astc_ldr not available\n");
+        } else {
+            GLuint ctex = 0;
+            glGenTextures(1, &ctex);
+            glBindTexture(GL_TEXTURE_2D, ctex);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, g.buf);
+            glCompressedTexImage2D(GL_TEXTURE_2D, 0, gpuastc::Encoder::internal_format(block), W, H, 0, (GLsizei)total, nullptr);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+            const GLenum err = glGetError();
+            std::printf("upload to ASTC texture: %s\n", err == GL_NO_ERROR ? "ok" : "failed");
+            if (err != GL_NO_ERROR) std::printf("  GL error 0x%x\n", err);
+            glDeleteTextures(1, &ctex);
+        }
+    }
+
+    p.clear();
+    return true;
 }
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+const long long kSmallPixels = 1 << 18;      // images up to this size are packed together
+const long long kPackPixels = 1 << 20;       // flush a pack once it holds this many pixels
+const long long kMaxPendingPixels = 1 << 24; // flush everything above this many waiting pixels
+
+} // namespace
 
 int main(int argc, char** argv)
 {
     if (argc < 3) { usage(); return 1; }
 
-    gpuastc::Options opt;
-    opt.block = 0; // 0 = auto, resolved once the image size and alpha are known
-    int alpha_mode = 0; // 0 auto, 1 on, 2 off
-    bool verbose = false, upload = false;
-    for (int i = 3; i < argc; ++i) {
+    Cli cli;
+    int first_opt = 3;
+    if (!std::strcmp(argv[1], "-batch")) {
+        if (argc < 4) { usage(); return 1; }
+        cli.batch = true;
+        cli.in = argv[2];
+        cli.out = argv[3];
+        first_opt = 4;
+    } else {
+        cli.in = argv[1];
+        cli.out = argv[2];
+    }
+    for (int i = first_opt; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-b") && i + 1 < argc) {
             const char* v = argv[++i];
-            opt.block = !std::strcmp(v, "auto") ? 0 : std::atoi(v);
+            cli.block = !std::strcmp(v, "auto") ? 0 : std::atoi(v);
         }
         else if (!std::strcmp(argv[i], "-alpha") && i + 1 < argc) {
             const char* v = argv[++i];
-            alpha_mode = !std::strcmp(v, "on") ? 1 : !std::strcmp(v, "off") ? 2 : 0;
+            cli.alpha_mode = !std::strcmp(v, "on") ? 1 : !std::strcmp(v, "off") ? 2 : 0;
         }
-        else if (!std::strcmp(argv[i], "-norm")) opt.normal_map = true;
-        else if (!std::strcmp(argv[i], "-upload")) upload = true;
-        else if (!std::strcmp(argv[i], "-v")) verbose = true;
+        else if (!std::strcmp(argv[i], "-j") && i + 1 < argc) cli.threads = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "-norm")) cli.normal = true;
+        else if (!std::strcmp(argv[i], "-upload")) cli.upload = true;
+        else if (!std::strcmp(argv[i], "-v")) cli.verbose = true;
         else { usage(); return 1; }
     }
-    if (opt.block != 0 && opt.block != 4 && opt.block != 5 && opt.block != 6) {
+    if (cli.block != 0 && cli.block != 4 && cli.block != 5 && cli.block != 6) {
         std::fprintf(stderr, "block must be auto, 4, 5 or 6\n");
         return 1;
     }
 
-    // Load as RGBA8: grey, grey+alpha, RGB, palette and 16-bit PNGs are all converted.
-    int w = 0, h = 0, comp = 0;
-    stbi_uc* pixels = stbi_load(argv[1], &w, &h, &comp, 4);
-    if (!pixels) { std::fprintf(stderr, "cannot load %s: %s\n", argv[1], stbi_failure_reason()); return 1; }
-
-    bool any_alpha = false;
-    for (size_t i = 3; i < (size_t)w * h * 4; i += 4)
-        if (pixels[i] != 255) { any_alpha = true; break; }
-    opt.alpha = alpha_mode == 1 || (alpha_mode == 0 && any_alpha);
-    if (opt.block == 0)
-        opt.block = gpuastc::Encoder::pick_block(w, h, opt.alpha);
-    if (verbose)
-        std::printf("%dx%d, %d source channels, alpha %s, block %dx%d\n", w, h, comp,
-                    opt.alpha ? "on" : "off", opt.block, opt.block);
+    // what to convert
+    FileList files;
+    if (cli.batch) {
+        if (!list_directory(cli.in, cli.out, files)) { std::fprintf(stderr, "cannot read directory %s\n", cli.in.c_str()); return 1; }
+        mkdir(cli.out.c_str(), 0755); // ok if it already exists
+        if (files.empty()) { std::fprintf(stderr, "no .png files in %s\n", cli.in.c_str()); return 1; }
+    } else {
+        files.push_back(std::make_pair(cli.in, cli.out));
+    }
 
     // GLES 3.1 context through SDL2 (hidden window; works with offscreen/KMSDRM drivers).
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1; }
@@ -102,63 +409,111 @@ int main(int argc, char** argv)
     if (!win) { std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
     SDL_GLContext ctx = SDL_GL_CreateContext(win);
     if (!ctx) { std::fprintf(stderr, "SDL_GL_CreateContext (GLES 3.1): %s\n", SDL_GetError()); return 1; }
-    if (verbose)
+    if (cli.verbose)
         std::printf("GL %s | %s\n", glGetString(GL_VERSION), glGetString(GL_RENDERER));
 
-    gpuastc::Encoder enc;
-    std::string log;
-    if (!enc.create(opt, &log)) { std::fprintf(stderr, "shader error:\n%s\n", log.c_str()); return 1; }
-
-    GLuint tex = 0, buf = 0;
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, w, h);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    Gpu gpu;
+    gpu.normal = cli.normal;
+    gpu.upload = cli.upload;
+    gpu.verbose = cli.verbose;
+    GLint max_tex = 2048;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+    gpu.max_tex = (int)max_tex;
+    gpu.max_height = std::min<int>((int)max_tex, 8192);
+    glGenTextures(1, &gpu.tex);
+    glBindTexture(GL_TEXTURE_2D, gpu.tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); // texelFetch needs a complete texture
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    stbi_image_free(pixels);
+    glGenBuffers(1, &gpu.buf);
 
-    glGenBuffers(1, &buf);
-    Uint64 t0 = SDL_GetPerformanceCounter();
-    if (!enc.encode(tex, w, h, buf)) { std::fprintf(stderr, "dispatch failed (GL error 0x%x)\n", glGetError()); return 1; }
-    glFinish();
-    double ms = 1000.0 * (double)(SDL_GetPerformanceCounter() - t0) / (double)SDL_GetPerformanceFrequency();
+    // decoder threads
+    int nthreads = cli.threads;
+    if (nthreads <= 0) {
+        const int hw = (int)std::thread::hardware_concurrency();
+        nthreads = std::max(1, std::min(hw - 1, 16));
+    }
+    if (!cli.batch) nthreads = 1;
+    nthreads = std::min<int>(nthreads, (int)files.size());
 
-    const int bx = gpuastc::Encoder::blocks(w, opt.block), by = gpuastc::Encoder::blocks(h, opt.block);
-    const size_t size = (size_t)bx * by * 16;
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf);
-    const void* mapped = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)size, GL_MAP_READ_BIT);
-    if (!mapped) { std::fprintf(stderr, "map failed (GL error 0x%x)\n", glGetError()); return 1; }
-    bool saved = save_astc(argv[2], opt.block, w, h, mapped, size);
-    glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
-    if (!saved) { std::fprintf(stderr, "cannot write %s\n", argv[2]); return 1; }
-    std::printf("%s: %dx%d -> %dx%d blocks (%zu bytes) in %.2f ms\n", argv[2], w, h, bx, by, size, ms);
-
-    if (upload) {
-        // Zero-copy path for real use: SSBO -> PBO unpack -> ASTC texture.
-        if (!has_extension("GL_KHR_texture_compression_astc_ldr")) {
-            std::fprintf(stderr, "upload: GL_KHR_texture_compression_astc_ldr not available\n");
-        } else {
-            GLuint ctex = 0;
-            glGenTextures(1, &ctex);
-            glBindTexture(GL_TEXTURE_2D, ctex);
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buf);
-            glCompressedTexImage2D(GL_TEXTURE_2D, 0, gpuastc::Encoder::internal_format(opt.block),
-                                   w, h, 0, (GLsizei)size, nullptr);
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-            GLenum err = glGetError();
-            std::printf("upload to ASTC texture: %s\n", err == GL_NO_ERROR ? "ok" : "failed");
-            if (err != GL_NO_ERROR) std::printf("  GL error 0x%x\n", err);
-            glDeleteTextures(1, &ctex);
-        }
+    JobQueue queue(256u << 20); // at most ~256 MB of decoded pixels waiting
+    std::atomic<size_t> next(0);
+    std::atomic<int> decode_failed(0);
+    std::atomic<int> running(nthreads);
+    std::vector<double> decode_ms(nthreads, 0.0);
+    std::vector<std::thread> workers;
+    const double wall0 = now_ms();
+    for (int t = 0; t < nthreads; ++t) {
+        workers.emplace_back([&, t]() {
+            for (;;) {
+                const size_t i = next.fetch_add(1);
+                if (i >= files.size()) break;
+                Job j;
+                std::string err;
+                const double t0 = now_ms();
+                if (!gpuastc::decode_png(files[i].first.c_str(), j.img, &err)) {
+                    std::fprintf(stderr, "%s: %s\n", files[i].first.c_str(), err.c_str());
+                    ++decode_failed;
+                    continue;
+                }
+                decode_ms[t] += now_ms() - t0;
+                j.alpha = cli.alpha_mode == 1 || (cli.alpha_mode == 0 && j.img.alpha);
+                j.block = cli.block ? cli.block : gpuastc::Encoder::pick_block(j.img.w, j.img.h, j.alpha);
+                j.out_path = files[i].second;
+                queue.push(std::move(j));
+            }
+            if (--running == 0)
+                queue.close();
+        });
     }
 
-    glDeleteBuffers(1, &buf);
-    glDeleteTextures(1, &tex);
-    enc.destroy();
+    // GL thread: collect small images into packs, encode big ones directly.
+    std::map<std::tuple<int, bool, int>, Pack> packs;
+    long long pending = 0;
+    Job job;
+    while (queue.pop(job)) {
+        const int w = job.img.w, h = job.img.h;
+        if ((long long)w * h > kSmallPixels) {
+            Pack one;
+            one.block = job.block;
+            one.alpha = job.alpha;
+            one.add(std::move(job));
+            flush_pack(gpu, one);
+            continue;
+        }
+        const int pw = Pack::pad(w, job.block), ph = Pack::pad(h, job.block);
+        Pack& p = packs[std::make_tuple(job.block, job.alpha, pw)];
+        if (p.jobs.empty()) { p.block = job.block; p.alpha = job.alpha; p.width = pw; }
+        if (p.height + ph > gpu.max_height) { pending -= p.pixels; flush_pack(gpu, p); }
+        pending += (long long)w * h;
+        p.add(std::move(job));
+        if (p.pixels >= kPackPixels) { pending -= p.pixels; flush_pack(gpu, p); }
+        if (pending > kMaxPendingPixels) {
+            for (auto& kv : packs) flush_pack(gpu, kv.second);
+            pending = 0;
+        }
+    }
+    for (auto& kv : packs) flush_pack(gpu, kv.second);
+    for (std::thread& t : workers) t.join();
+    const double wall = now_ms() - wall0;
+    gpu.files_failed += decode_failed.load();
+
+    double dec_total = 0;
+    for (double d : decode_ms) dec_total += d;
+    if (cli.batch || cli.verbose) {
+        std::printf("%d files converted, %d failed, %.2f Mpx in %.0f ms (%.1f files/s, %.1f Mpx/s)\n",
+                    gpu.files_ok, gpu.files_failed, gpu.pixels / 1e6, wall,
+                    wall > 0 ? gpu.files_ok * 1000.0 / wall : 0.0, wall > 0 ? gpu.pixels / 1e3 / wall : 0.0);
+        std::printf("  decode %.0f ms across %d thread(s), GPU upload+encode+readback %.0f ms in %d dispatch(es), file writes %.0f ms, output %.1f MB\n",
+                    dec_total, nthreads, gpu.ms_gpu, gpu.dispatches, gpu.ms_write, gpu.bytes_out / 1e6);
+    } else if (gpu.files_ok == 1) {
+        std::printf("%s: written in %.2f ms (GPU %.2f ms)\n", files[0].second.c_str(), wall, gpu.ms_gpu);
+    }
+
+    gpu.encoders.clear();
+    glDeleteBuffers(1, &gpu.buf);
+    glDeleteTextures(1, &gpu.tex);
     SDL_GL_DeleteContext(ctx);
     SDL_DestroyWindow(win);
     SDL_Quit();
-    return 0;
+    return gpu.files_failed ? 1 : 0;
 }

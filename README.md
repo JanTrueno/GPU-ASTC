@@ -4,8 +4,8 @@ ASTC LDR texture encoder that runs as an **OpenGL ES 3.1 compute shader**.
 Aimed at aarch64 Linux embedded devices with no window system: the GLES
 context comes from SDL2 (KMSDRM or offscreen video driver).
 
-Status: the shader is validated on desktop OpenGL 4.3 (see Tests). The GLES 3.1
-build, SDL2 host and `-upload` path have **not been built or run yet**.
+Status: the shader is validated on desktop OpenGL 4.3 (see Tests). The C++ tool (GLES 3.1
+host, SDL2, batch mode, PNG decoder) has **not been compiled or run yet**.
 
 ## What it does
 
@@ -23,10 +23,28 @@ Ported from niepp/astc_encoder: single partition, single weight plane, a fixed
 4x4 weight grid, 8-bit endpoints and a fixed weight quantization. Quality is
 that of a fast real-time encoder. Improving it is the point of this repo.
 
+## Batch mode
+
+```bash
+gpuastc -batch textures/ out/ -v        # every .png in textures/ -> out/<name>.astc
+```
+
+One process, one GL context, one compiled shader per (block size, alpha) combination. Worker
+threads decode PNGs (`-j N`, default cores - 1) while the GL thread encodes. Images up to
+512x512 are packed: images with the same block size, alpha mode and padded width are stacked
+into one tall texture (each padded to whole blocks with replicated edge pixels) and encoded in
+a single dispatch, then each image's blocks are sliced out. Larger images are encoded one by one.
+`tests/pack_test.py` checks the packing on the desktop GPU (each stacked image must encode
+identically to the image on its own).
+
+PNG decoding uses libdeflate when it is available at build time (`apt install libdeflate-dev`),
+which is much faster than stb_image; unusual PNGs (interlaced) fall back to stb_image.
+`build/png_compare *.png` checks the two decoders against each other.
+
 ## Build
 
 ```bash
-sudo apt install build-essential cmake libsdl2-dev libgles2-mesa-dev
+sudo apt install build-essential cmake libsdl2-dev libgles2-mesa-dev libdeflate-dev
 cmake -S . -B build && cmake --build build
 SDL_VIDEODRIVER=offscreen ./build/gpuastc in.png out.astc -v
 ```
