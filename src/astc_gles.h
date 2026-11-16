@@ -9,7 +9,7 @@
 namespace gpuastc {
 
 struct Options {
-    int block = 4;           // 4 (4x4) or 6 (6x6)
+    int block = 4;           // 4 (4x4), 5 (5x5) or 6 (6x6)
     bool alpha = false;      // encode alpha (RGBA endpoints)
     bool normal_map = false; // force B and A to 1.0
 };

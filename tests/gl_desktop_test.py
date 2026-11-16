@@ -11,7 +11,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 def shader_source(block, alpha, normal=False):
     body = (ROOT / "shaders/astc_encode.comp").read_text()
-    head = f"#version 430\n#define BLOCK_6X6 {int(block == 6)}\n#define HAS_ALPHA {int(alpha)}\n#define IS_NORMALMAP {int(normal)}\n"
+    head = f"#version 430\n#define BLOCK_DIM {block}\n#define HAS_ALPHA {int(alpha)}\n#define IS_NORMALMAP {int(normal)}\n"
     return head + body
 
 def gpu_encode(ctx, rgba, block, alpha):
@@ -72,7 +72,7 @@ def main():
         h, w, _ = rgba.shape
         has_a = bool((rgba[..., 3] != 255).any())
         ch = 4 if has_a else 3
-        for block in (4, 6):
+        for block in (4, 5, 6):
             data = gpu_encode(ctx, rgba, block, has_a)
             dec, actx = decode(data, w, h, block)
             ref = cpu_encode(actx, rgba, block)

@@ -7,10 +7,10 @@ core = args[0] if args else "Mali-G31"
 exe = args[1] if len(args) > 1 else "C:/Program Files/Arm/Arm Performance Studio 2026.6/mali_offline_compiler/malioc.exe"
 src = (ROOT / "shaders/astc_encode.comp").read_text()
 with tempfile.TemporaryDirectory() as d:
-    for block in (4, 6):
+    for block in (4, 5, 6):
         for alpha in (0, 1):
             f = pathlib.Path(d) / f"astc_{block}_{alpha}.comp"
-            f.write_text(f"#version 310 es\n#define BLOCK_6X6 {int(block == 6)}\n#define HAS_ALPHA {alpha}\n#define IS_NORMALMAP 0\n" + src)
+            f.write_text(f"#version 310 es\n#define BLOCK_DIM {block}\n#define HAS_ALPHA {alpha}\n#define IS_NORMALMAP 0\n" + src)
             r = subprocess.run([exe, "--core", core, str(f)], capture_output=True, text=True)
             out = r.stdout + r.stderr
             if "--verbose" in sys.argv: print(out)

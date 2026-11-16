@@ -18,7 +18,7 @@ static void usage()
 {
     std::fprintf(stderr,
         "usage: gpuastc input.png output.astc [options]\n"
-        "  -b 4|6            block size (default 4)\n"
+        "  -b 4|5|6          block size (default 4)\n"
         "  -alpha auto|on|off  encode alpha (default auto: on if any alpha < 255)\n"
         "  -norm             normal map (B and A forced to 1)\n"
         "  -upload           also upload the result into an ASTC texture on the GPU (self-test)\n"

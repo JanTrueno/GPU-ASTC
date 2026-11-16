@@ -12,8 +12,8 @@ precision highp float;
 precision highp int;
 precision highp sampler2D;
 
-#ifndef BLOCK_6X6
-#define BLOCK_6X6 0
+#ifndef BLOCK_DIM
+#define BLOCK_DIM 4   // block size: 4, 5 or 6 (4x4, 5x5, 6x6)
 #endif
 #ifndef HAS_ALPHA
 #define HAS_ALPHA 0
@@ -22,11 +22,7 @@ precision highp sampler2D;
 #define IS_NORMALMAP 0
 #endif
 
-#if BLOCK_6X6
-#define DIM 6
-#else
-#define DIM 4
-#endif
+#define DIM BLOCK_DIM
 
 #define BLOCK_SIZE ((DIM) * (DIM))
 #define X_GRIDS 4
@@ -252,7 +248,7 @@ float tap_weight(int far)
 // (k0 = dot(vec_k, ep0)). Each texel is projected to a scalar as soon as it is fetched.
 float weight_proj(int i, vec4 vec_k, float k0)
 {
-#if BLOCK_6X6
+#if BLOCK_DIM == 6
     // bilinear resample of the 6x6 block onto the 4x4 weight grid: cell (gx, gy)
     // covers texels x0..x0+1, y0..y0+1 with x0, y0 in {0,1,3,4}.
     int gx = i & 3;
@@ -266,6 +262,20 @@ float weight_proj(int i, vec4 vec_k, float k0)
               + dot(vec_k, texel(base + 1)) * tap_weight((1 - px) + py)
               + dot(vec_k, texel(base + 6)) * tap_weight(px + (1 - py))
               + dot(vec_k, texel(base + 7)) * tap_weight((1 - px) + (1 - py));
+#elif BLOCK_DIM == 5
+    // linear resample of the 5x5 block onto the 4x4 weight grid. Grid cell g sits at texel
+    // coordinate g*4/3 (where the decoder's own infill places it): x0 = floor, frac in thirds.
+    int gx = i & 3;
+    int gy = i >> 2;
+    int x0 = min((gx * 4) / 3, 3);
+    int y0 = min((gy * 4) / 3, 3);
+    float fx = float(gx * 4 - 3 * x0) * (1.0 / 3.0);
+    float fy = float(gy * 4 - 3 * y0) * (1.0 / 3.0);
+    int base = y0 * 5 + x0;
+    float sum = dot(vec_k, texel(base))     * ((1.0 - fx) * (1.0 - fy))
+              + dot(vec_k, texel(base + 1)) * (fx * (1.0 - fy))
+              + dot(vec_k, texel(base + 5)) * ((1.0 - fx) * fy)
+              + dot(vec_k, texel(base + 6)) * (fx * fy);
 #else
     float sum = dot(vec_k, texel(i));
 #endif
@@ -359,8 +369,8 @@ uvec4 encode_block()
                          a.b | (b.b << 8u), 0u, 0u);
 #endif
 
-#if BLOCK_6X6
-    // 6x6: every projection needs 4 texel fetches, so compute each cell once and keep it.
+#if BLOCK_DIM != 4
+    // 5x5 and 6x6: every projection needs 4 texel fetches, so compute each cell once and keep it.
     // weights: project every grid cell once (kept in registers), then quantize.
     // A degenerate axis (flat block) gives vec_k = 0, so every projection is 0 and every weight 0.
     vec4 vec_k = ep1 - ep0;

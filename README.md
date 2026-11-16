@@ -10,7 +10,7 @@ build, SDL2 host and `-upload` path have **not been built or run yet**.
 ## What it does
 
 - Loads PNG (grey, grey+alpha, RGB, RGBA, palette, 16-bit) and converts to RGBA8.
-- Encodes ASTC 4x4 or 6x6, one block per GPU invocation.
+- Encodes ASTC 4x4, 5x5 or 6x6 (`-b 4|5|6`), one block per GPU invocation.
 - Transparency: RGBA endpoints, enabled automatically when any alpha < 255.
 - Writes `.astc` files, and can upload straight into a `GL_COMPRESSED_RGBA_ASTC_*`
   texture through a pixel unpack buffer (`-upload`).
@@ -50,6 +50,8 @@ Measured with Arm's `malioc` (`tests/malioc_check.py`), GLSL ES 3.10. The shader
 | 4x4 critical path (cycles) | 231-239, load/store bound | ~155, arithmetic bound |
 | 6x6 registers / occupancy | 64 / 50%, 640-768 B stack | 51-55 / 50%, 64 B stack |
 | 6x6 critical path (cycles) | ~303 arithmetic, 288 load/store | ~400-416 arithmetic, 25 load/store |
+
+5x5 uses the same code path as 6x6 (51-56 registers, 50% occupancy, 64 B stack).
 
 How: texels are re-fetched instead of held in registers, weights are quantized in a
 second pass (4x4) or stored (6x6), and the power iteration runs 3 times instead of 8 (no

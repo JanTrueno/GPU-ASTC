@@ -5,8 +5,11 @@ namespace gpuastc {
 
 GLenum Encoder::internal_format(int block)
 {
-    return block == 6 ? 0x93B4u /* GL_COMPRESSED_RGBA_ASTC_6x6_KHR */
-                      : 0x93B0u /* GL_COMPRESSED_RGBA_ASTC_4x4_KHR */;
+    switch (block) {
+    case 6:  return 0x93B4u; // GL_COMPRESSED_RGBA_ASTC_6x6_KHR
+    case 5:  return 0x93B2u; // GL_COMPRESSED_RGBA_ASTC_5x5_KHR
+    default: return 0x93B0u; // GL_COMPRESSED_RGBA_ASTC_4x4_KHR
+    }
 }
 
 Encoder::~Encoder() { destroy(); }
@@ -25,7 +28,8 @@ bool Encoder::create(const Options& opt, std::string* log)
     opt_ = opt;
 
     std::string src = "#version 310 es\n";
-    src += std::string("#define BLOCK_6X6 ") + (opt.block == 6 ? "1" : "0") + "\n";
+    src += "#define BLOCK_DIM " + std::to_string(opt.block) + "
+";
     src += std::string("#define HAS_ALPHA ") + (opt.alpha ? "1" : "0") + "\n";
     src += std::string("#define IS_NORMALMAP ") + (opt.normal_map ? "1" : "0") + "\n";
     src += kShaderSource;

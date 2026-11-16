@@ -35,7 +35,7 @@ def main():
             im = img.copy()
             if alpha and (im[..., 3] == 255).all():
                 im[..., 3] = (np.arange(w)[None, :] * 255 // max(w - 1, 1)).astype(np.uint8)  # force alpha variation
-            for block in (4, 6):
+            for block in (4, 5, 6):
                 ms, data = run(ctx, im, block, alpha)
                 key = BASE / f"{pathlib.Path(p).stem}_{block}_{int(alpha)}.bin"
                 if save: key.write_bytes(data); status = "saved"

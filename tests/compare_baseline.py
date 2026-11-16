@@ -14,7 +14,7 @@ for p in sys.argv[1:]:
         if alpha and (im[..., 3] == 255).all():
             im[..., 3] = (np.arange(w)[None, :] * 255 // max(w - 1, 1)).astype(np.uint8)
         ch = 4 if alpha else 3
-        for block in (4, 6):
+        for block in (4, 5, 6):
             _, data = bench.run(ctx, im, block, alpha, n=1)
             base = (bench.BASE / f"{pathlib.Path(p).stem}_{block}_{int(alpha)}.bin").read_bytes()
             d1, _ = t.decode(base, w, h, block); d2, _ = t.decode(data, w, h, block)
