@@ -57,6 +57,7 @@ void usage()
         "  -alpha auto|on|off  encode alpha (default auto: on if any alpha < 255)\n"
         "  -norm             normal map (B and A forced to 1)\n"
         "  -j N              decoder threads in batch mode (default: cores - 1)\n"
+        "  -prefetch N       read up to N files ahead into the page cache on helper threads (slow storage)\n"
         "  -update           skip files whose .astc is already newer than the .png\n"
         "                    (with -pack: reuse unchanged entries from the existing archive)\n"
         "  -upload           also upload the result into an ASTC texture on the GPU (self-test)\n"
@@ -71,6 +72,7 @@ struct Cli {
     bool verbose = false;
     int threads = 0;
     bool update = false; // skip up-to-date outputs
+    int prefetch = 0;    // read-ahead distance in files (0 = off)
     bool batch = false;
     bool pack = false;   // -pack: write one archive instead of one file per texture
     bool unpack = false; // -unpack: archive -> .astc files
@@ -576,6 +578,7 @@ int main(int argc, char** argv)
         }
         else if (!std::strcmp(argv[i], "-j") && i + 1 < argc) cli.threads = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-update")) cli.update = true;
+        else if (!std::strcmp(argv[i], "-prefetch") && i + 1 < argc) cli.prefetch = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-norm")) cli.normal = true;
         else if (!std::strcmp(argv[i], "-upload")) cli.upload = true;
         else if (!std::strcmp(argv[i], "-v")) cli.verbose = true;
@@ -678,6 +681,7 @@ int main(int argc, char** argv)
     std::atomic<int> skipped(0);
     std::atomic<int> running(nthreads);
     std::vector<double> decode_ms(nthreads, 0.0);
+    std::vector<double> read_ms(nthreads, 0.0);
     std::vector<std::thread> workers;
     const double wall0 = now_ms();
     for (int t = 0; t < nthreads; ++t) {
@@ -716,13 +720,18 @@ int main(int argc, char** argv)
                 }
                 Job j;
                 std::string err;
+                std::vector<uint8_t> file_bytes;
                 const double t0 = now_ms();
-                if (!gpuastc::decode_png(files[i].first.c_str(), j.img, &err)) {
+                const bool read_ok = gpuastc::read_file(files[i].first.c_str(), file_bytes);
+                const double t1 = now_ms();
+                if (!read_ok) err = "cannot read file";
+                if (!read_ok || !gpuastc::decode_png_memory(file_bytes, j.img, &err)) {
                     std::fprintf(stderr, "%s: %s\n", files[i].first.c_str(), err.c_str());
                     ++decode_failed;
                     continue;
                 }
-                decode_ms[t] += now_ms() - t0;
+                read_ms[t] += t1 - t0;
+                decode_ms[t] += now_ms() - t1;
                 j.alpha = cli.alpha_mode == 1 || (cli.alpha_mode == 0 && j.img.alpha);
                 j.block = cli.block ? cli.block : gpuastc::Encoder::pick_block(j.img.w, j.img.h, j.alpha);
                 j.out_path = files[i].second;
@@ -732,6 +741,32 @@ int main(int argc, char** argv)
             if (--running == 0)
                 queue.close();
         });
+    }
+
+    // Optional read-ahead: helper threads ask the OS to load the next files into the page cache,
+    // so the decode threads find them in memory (hides per-file latency on slow storage).
+    std::atomic<size_t> pf_next(0);
+    std::atomic<bool> pf_stop(false);
+    std::vector<std::thread> prefetchers;
+    if (cli.prefetch > 0) {
+        for (int k = 0; k < 2; ++k) {
+            prefetchers.emplace_back([&]() {
+                for (;;) {
+                    const size_t i = pf_next.fetch_add(1);
+                    if (i >= files.size()) break;
+                    while (!pf_stop.load() && i >= next.load() + (size_t)cli.prefetch)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    if (pf_stop.load()) break;
+                    const int fd = ::open(files[i].first.c_str(), O_RDONLY);
+                    if (fd >= 0) {
+                        struct stat st;
+                        if (fstat(fd, &st) == 0 && st.st_size > 0)
+                            readahead(fd, 0, (size_t)st.st_size);
+                        ::close(fd);
+                    }
+                }
+            });
+        }
     }
 
     // GL thread: collect small images into packs, encode big ones directly.
@@ -762,6 +797,8 @@ int main(int argc, char** argv)
     }
     for (auto& kv : packs) flush_pack(gpu, kv.second);
     for (std::thread& t : workers) t.join();
+    pf_stop = true;
+    for (std::thread& t : prefetchers) t.join();
     write_queue.close();
     writer.join();
     bool pack_ok = true;
@@ -774,14 +811,15 @@ int main(int argc, char** argv)
     const double wall = now_ms() - wall0;
     gpu.files_failed += decode_failed.load();
 
-    double dec_total = 0;
+    double dec_total = 0, read_total = 0;
     for (double d : decode_ms) dec_total += d;
+    for (double d : read_ms) read_total += d;
     if (cli.batch || cli.verbose) {
         std::printf("%d files converted, %d up to date (skipped), %d failed, %.2f Mpx in %.0f ms (%.1f files/s, %.1f Mpx/s)\n",
                     gpu.files_ok, skipped.load(), gpu.files_failed, gpu.pixels / 1e6, wall,
                     wall > 0 ? gpu.files_ok * 1000.0 / wall : 0.0, wall > 0 ? gpu.pixels / 1e3 / wall : 0.0);
-        std::printf("  decode %.0f ms across %d thread(s), GPU upload+encode+readback %.0f ms in %d dispatch(es), file writes %.0f ms (own thread), output %.1f MB\n",
-                    dec_total, nthreads, gpu.ms_gpu, gpu.dispatches, write_ms, gpu.bytes_out / 1e6);
+        std::printf("  file read %.0f ms + decode %.0f ms across %d thread(s), GPU upload+encode+readback %.0f ms in %d dispatch(es), file writes %.0f ms (own thread), output %.1f MB\n",
+                    read_total, dec_total, nthreads, gpu.ms_gpu, gpu.dispatches, write_ms, gpu.bytes_out / 1e6);
         if (cli.pack && pack_ok)
             std::printf("  archive %s: %zu entries (%d sharing identical data), %.1f MB\n", cli.out.c_str(),
                         pack_writer.ents.size(), pack_writer.shared, pack_writer.pos / 1e6);

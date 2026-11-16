@@ -351,6 +351,13 @@ bool decode_png_fast(const std::vector<uint8_t>&, Image&)
 
 #endif
 
+bool decode_png_memory(const std::vector<uint8_t>& file, Image& out, std::string* err)
+{
+    if (decode_png_fast(file, out))
+        return true;
+    return decode_png_stb(file, out, err);
+}
+
 bool decode_png(const char* path, Image& out, std::string* err)
 {
     std::vector<uint8_t> file;
@@ -358,9 +365,7 @@ bool decode_png(const char* path, Image& out, std::string* err)
         if (err) *err = "cannot read file";
         return false;
     }
-    if (decode_png_fast(file, out))
-        return true;
-    return decode_png_stb(file, out, err);
+    return decode_png_memory(file, out, err);
 }
 
 } // namespace gpuastc
