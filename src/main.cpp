@@ -8,7 +8,9 @@
 // The GLES context comes from SDL2, so it works on KMSDRM/offscreen with no window system.
 #include "astc_gles.h"
 #include "astcpak.h"
+#include "formats.h"
 #include "png_decode.h"
+#include "xnb.h"
 
 #include <SDL.h>
 
@@ -49,7 +51,9 @@ void usage()
 {
     std::fprintf(stderr,
         "usage: gpuastc input.png output.astc [options]\n"
-        "       gpuastc -batch input_dir output_dir [options]\n"
+        "       gpuastc input.xnb output.xnb [options]              (XNA/FNA texture -> ASTC xnb)\n"
+        "       gpuastc -batch input_dir output_dir [options]       (.png and .xnb, subfolders included;\n"
+        "                                                            input_dir == output_dir converts in place)\n"
         "       gpuastc -pack input_dir archive.astcpak [options]   (all textures in one file)\n"
         "       gpuastc -unpack archive.astcpak output_dir          (back to .astc files)\n"
         "  -b auto|4|5|6     block size (default auto: 4x4 up to 256x256, thin or alpha textures;\n"
@@ -95,29 +99,61 @@ bool write_astc(const std::string& path, int bdim, int w, int h, const uint8_t* 
     return ok;
 }
 
-bool ends_with_png(const std::string& s)
+// Writes through <path>.tmp and renames, so an interrupted run (or converting in place) never leaves a broken file.
+bool write_file_atomic(const std::string& path, const uint8_t* data, size_t size)
 {
-    if (s.size() < 4) return false;
-    std::string e = s.substr(s.size() - 4);
-    for (char& c : e) c = (char)std::tolower((unsigned char)c);
-    return e == ".png";
+    const std::string tmp = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    const bool ok = std::fwrite(data, 1, size, f) == size;
+    if (std::fclose(f) != 0 || !ok) { std::remove(tmp.c_str()); return false; }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) { std::remove(tmp.c_str()); return false; }
+    return true;
 }
 
-typedef std::vector<std::pair<std::string, std::string>> FileList; // (input path, output path)
+void make_parents(const std::string& path)
+{
+    for (size_t i = 1; i < path.size(); ++i)
+        if (path[i] == '/') mkdir(path.substr(0, i).c_str(), 0755); // fails harmlessly if it exists
+}
 
-bool list_directory(const std::string& in_dir, const std::string& out_dir, FileList& files)
+typedef std::vector<std::pair<std::string, std::string>> FileList; // (input path, output path / entry name)
+
+void walk_directory(const std::string& root, const std::string& rel, std::vector<std::string>& names)
+{
+    DIR* d = opendir((rel.empty() ? root : root + "/" + rel).c_str());
+    if (!d) return;
+    std::vector<std::string> entries;
+    while (dirent* e = readdir(d)) entries.push_back(e->d_name);
+    closedir(d);
+    for (const std::string& n : entries) {
+        if (n == "." || n == "..") continue;
+        const std::string r = rel.empty() ? n : rel + "/" + n;
+        struct stat st;
+        if (stat((root + "/" + r).c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) walk_directory(root, r, names);
+        else if (gpuastc::input_format_for(n)) names.push_back(r);
+    }
+}
+
+// Every supported file below in_dir. The output of "dir/a.png" is "out/dir/a.astc"; an .xnb keeps its
+// name ("out/dir/a.xnb", now holding ASTC). With `pack` the output is the entry name instead ("dir/a").
+bool list_directory(const std::string& in_dir, const std::string& out_dir, bool pack, FileList& files)
 {
     DIR* d = opendir(in_dir.c_str());
     if (!d) return false;
-    std::vector<std::string> names;
-    while (dirent* e = readdir(d)) {
-        std::string n = e->d_name;
-        if (ends_with_png(n)) names.push_back(n);
-    }
     closedir(d);
+    std::vector<std::string> names;
+    walk_directory(in_dir, "", names);
     std::sort(names.begin(), names.end());
-    for (const std::string& n : names)
-        files.push_back(std::make_pair(in_dir + "/" + n, out_dir + "/" + n.substr(0, n.size() - 4) + ".astc"));
+    for (const std::string& n : names) {
+        const gpuastc::InputFormat* fmt = gpuastc::input_format_for(n);
+        const std::string stem = n.substr(0, n.size() - std::strlen(fmt->ext));
+        std::string out;
+        if (pack) out = stem;
+        else out = out_dir + "/" + (fmt->writes_same_container ? n : stem + ".astc");
+        files.push_back(std::make_pair(in_dir + "/" + n, out));
+    }
     return true;
 }
 
@@ -139,6 +175,7 @@ struct WriteJob {
     bool alpha = false;
     uint64_t src_size = 0, src_mtime = 0;
     std::vector<uint8_t> data;
+    std::vector<uint8_t> meta;    // non-empty: write the source container (.xnb) with ASTC inside
     const uint8_t* ext = nullptr; // -pack -update: blocks to copy from the old archive instead of `data`
     size_t ext_size = 0;
 };
@@ -508,6 +545,7 @@ bool flush_pack(Gpu& g, Pack& p)
         wj.src_size = j.src_size;
         wj.src_mtime = j.src_mtime;
         wj.data.assign(mapped + first, mapped + first + size);
+        wj.meta = std::move(p.jobs[k].img.meta);
         g.writer->push(std::move(wj)); // saved on the writer thread, overlapping the next dispatch
         ++g.files_ok;
         g.pixels += (long long)j.img.w * j.img.h;
@@ -595,18 +633,9 @@ int main(int argc, char** argv)
     // what to convert
     FileList files;
     if (cli.batch) {
-        if (!list_directory(cli.in, cli.out, files)) { std::fprintf(stderr, "cannot read directory %s\n", cli.in.c_str()); return 1; }
-        if (cli.pack) {
-            // the "output" of each file is its entry name in the archive: the file name without ".png"
-            for (auto& f : files) {
-                const size_t slash = f.first.find_last_of('/');
-                const std::string base = f.first.substr(slash == std::string::npos ? 0 : slash + 1);
-                f.second = base.substr(0, base.size() - 4);
-            }
-        } else {
-            mkdir(cli.out.c_str(), 0755); // ok if it already exists
-        }
-        if (files.empty()) { std::fprintf(stderr, "no .png files in %s\n", cli.in.c_str()); return 1; }
+        if (!list_directory(cli.in, cli.out, cli.pack, files)) { std::fprintf(stderr, "cannot read directory %s\n", cli.in.c_str()); return 1; }
+        if (!cli.pack) mkdir(cli.out.c_str(), 0755); // ok if it already exists
+        if (files.empty()) { std::fprintf(stderr, "no .png or .xnb files in %s\n", cli.in.c_str()); return 1; }
     } else {
         files.push_back(std::make_pair(cli.in, cli.out));
     }
@@ -669,9 +698,25 @@ int main(int argc, char** argv)
             const double t0 = now_ms();
             if (cli.pack) {
                 pack_writer.add(wj);
-            } else if (!write_astc(wj.path, wj.block, wj.w, wj.h, wj.data.data(), wj.data.size())) {
-                std::fprintf(stderr, "cannot write %s%s", wj.path.c_str(), "\n");
-                ++write_failed;
+            } else {
+                make_parents(wj.path);
+                bool ok;
+                if (!wj.meta.empty()) {
+                    const std::vector<uint8_t> x = gpuastc::build_astc_xnb(wj.meta, wj.block, wj.w, wj.h, wj.data.data(), wj.data.size());
+                    ok = write_file_atomic(wj.path, x.data(), x.size());
+                } else {
+                    std::vector<uint8_t> a(16 + wj.data.size());
+                    const uint8_t hdr[16] = {0x13, 0xAB, 0xA1, 0x5C, (uint8_t)wj.block, (uint8_t)wj.block, 1,
+                                             (uint8_t)wj.w, (uint8_t)(wj.w >> 8), (uint8_t)(wj.w >> 16),
+                                             (uint8_t)wj.h, (uint8_t)(wj.h >> 8), (uint8_t)(wj.h >> 16), 1, 0, 0};
+                    std::memcpy(a.data(), hdr, 16);
+                    std::memcpy(a.data() + 16, wj.data.data(), wj.data.size());
+                    ok = write_file_atomic(wj.path, a.data(), a.size());
+                }
+                if (!ok) {
+                    std::fprintf(stderr, "cannot write %s\n", wj.path.c_str());
+                    ++write_failed;
+                }
             }
             write_ms += now_ms() - t0;
         }
@@ -679,6 +724,7 @@ int main(int argc, char** argv)
     std::atomic<size_t> next(0);
     std::atomic<int> decode_failed(0);
     std::atomic<int> skipped(0);
+    std::atomic<int> not_textures(0);
     std::atomic<int> running(nthreads);
     std::vector<double> decode_ms(nthreads, 0.0);
     std::vector<double> read_ms(nthreads, 0.0);
@@ -710,7 +756,7 @@ int main(int argc, char** argv)
                         continue;
                     }
                 }
-                if (cli.update && !cli.pack) { // output already there and not older than the input: nothing to do
+                if (cli.update && !cli.pack && files[i].first != files[i].second) { // output already there and not older than the input: nothing to do
                     struct stat st_in, st_out;
                     if (stat(files[i].first.c_str(), &st_in) == 0 && stat(files[i].second.c_str(), &st_out) == 0 &&
                         st_out.st_size > 16 && st_out.st_mtime >= st_in.st_mtime) {
@@ -725,7 +771,14 @@ int main(int argc, char** argv)
                 const bool read_ok = gpuastc::read_file(files[i].first.c_str(), file_bytes);
                 const double t1 = now_ms();
                 if (!read_ok) err = "cannot read file";
-                if (!read_ok || !gpuastc::decode_png_memory(file_bytes, j.img, &err)) {
+                const gpuastc::InputFormat* fmt = gpuastc::input_format_for(files[i].first);
+                if (!read_ok || !fmt || !fmt->decode(file_bytes, j.img, &err)) {
+                    if (read_ok && err == gpuastc::xnb_already_astc()) { ++skipped; continue; }
+                    if (read_ok && fmt && fmt->writes_same_container && cli.batch && err != "LZX data is corrupt" &&
+                        err.compare(0, 20, "surface format is no") != 0) { // fonts, models, ...: not an error in a game's Content folder
+                        ++not_textures;
+                        continue;
+                    }
                     std::fprintf(stderr, "%s: %s\n", files[i].first.c_str(), err.c_str());
                     ++decode_failed;
                     continue;
@@ -815,6 +868,7 @@ int main(int argc, char** argv)
     for (double d : decode_ms) dec_total += d;
     for (double d : read_ms) read_total += d;
     if (cli.batch || cli.verbose) {
+        if (not_textures.load()) std::printf("%d .xnb files are not textures (fonts, sounds, ...): left untouched\n", not_textures.load());
         std::printf("%d files converted, %d up to date (skipped), %d failed, %.2f Mpx in %.0f ms (%.1f files/s, %.1f Mpx/s)\n",
                     gpu.files_ok, skipped.load(), gpu.files_failed, gpu.pixels / 1e6, wall,
                     wall > 0 ? gpu.files_ok * 1000.0 / wall : 0.0, wall > 0 ? gpu.pixels / 1e3 / wall : 0.0);

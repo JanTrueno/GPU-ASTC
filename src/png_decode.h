@@ -15,6 +15,8 @@ struct Image {
     int w = 0, h = 0;
     bool alpha = false;          // true if any pixel has alpha < 255
     std::vector<uint8_t> rgba;   // w * h * 4, row-major, top row first
+    bool premultiplied = false;  // colour already multiplied by alpha (XNA content)
+    std::vector<uint8_t> meta;   // source-format data a writer needs (e.g. the XNB header)
 };
 
 bool read_file(const char* path, std::vector<uint8_t>& out);

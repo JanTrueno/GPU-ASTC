@@ -25,7 +25,7 @@ find_library(GLESV2_LIBRARY NAMES GLESv2 libGLESv2 REQUIRED)
 # PNG decoding: libdeflate gives a much faster decoder than stb_image alone (optional).
 find_path(LIBDEFLATE_INCLUDE_DIR libdeflate.h)
 find_library(LIBDEFLATE_LIBRARY NAMES deflate libdeflate)
-add_library(gpuastc_png STATIC src/png_decode.cpp)
+add_library(gpuastc_png STATIC src/png_decode.cpp src/lzx.cpp src/xnb.cpp src/formats.cpp)
 target_include_directories(gpuastc_png PUBLIC src PRIVATE third_party)
 if(LIBDEFLATE_INCLUDE_DIR AND LIBDEFLATE_LIBRARY)
   message(STATUS "libdeflate found: fast PNG decoder enabled")
@@ -54,3 +54,7 @@ target_link_libraries(png_compare PRIVATE gpuastc_png)
 add_executable(astcpak_test tests/astcpak_test.cpp)
 target_include_directories(astcpak_test PRIVATE include)
 target_link_libraries(astcpak_test PRIVATE gpuastc_png)
+
+# decodes .xnb textures and reports failures: build/xnb_test [-png outdir] files...
+add_executable(xnb_test tests/xnb_test.cpp)
+target_link_libraries(xnb_test PRIVATE gpuastc_png)
