@@ -4,8 +4,9 @@ ASTC LDR texture encoder that runs as an **OpenGL ES 3.1 compute shader**.
 Aimed at aarch64 Linux embedded devices with no window system: the GLES
 context comes from SDL2 (KMSDRM or offscreen video driver).
 
-Status: the shader is validated on desktop OpenGL 4.3 (see Tests). The C++ tool (GLES 3.1
-host, SDL2, batch mode, PNG decoder) has **not been compiled or run yet**.
+Status: builds and runs on Linux (tested on Ubuntu/WSL with SDL2's offscreen driver and Mesa's
+llvmpipe, GLES 3.2 context). Single-file and batch modes work, output decodes correctly with astcenc
+and matches the desktop-GL encoder in 99.9% of blocks. Not yet run on a real Mali device.
 
 ## What it does
 
@@ -18,6 +19,13 @@ host, SDL2, batch mode, PNG decoder) has **not been compiled or run yet**.
   texture through a pixel unpack buffer (`-upload`).
 
 ## Limits of the current encoder
+
+Hard-edged images with more than two colours per block (pixel-art sprites, icons with alpha) encode
+badly: on 16x16 sprites the PSNR is 15-22 dB where astcenc reaches 60-99 dB, because one colour line
+per block cannot represent three or more distinct colours. Smooth images are fine (typically within
+1-2 dB of astcenc fast at 4x4). Partitions are the missing feature; a practical stopgap is to measure
+the error per block and re-encode the bad ones with astcenc on the CPU.
+
 
 Ported from niepp/astc_encoder: single partition, single weight plane, a fixed
 4x4 weight grid, 8-bit endpoints and a fixed weight quantization. Quality is
@@ -38,7 +46,8 @@ a single dispatch, then each image's blocks are sliced out. Larger images are en
 identically to the image on its own).
 
 PNG decoding uses libdeflate when it is available at build time (`apt install libdeflate-dev`),
-which is much faster than stb_image; unusual PNGs (interlaced) fall back to stb_image.
+which is about 1.4-1.5x faster than stb_image here (inflate is only ~20% of the time, the PNG
+filters and pixel conversion the rest); unusual PNGs (interlaced) fall back to stb_image.
 `build/png_compare *.png` checks the two decoders against each other.
 
 ## Build

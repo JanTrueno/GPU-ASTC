@@ -74,48 +74,65 @@ inline uint32_t be16(const uint8_t* p)
     return ((uint32_t)p[0] << 8) | (uint32_t)p[1];
 }
 
-inline int paeth(int a, int b, int c)
+// Paeth predictor. p - a = b - c, p - b = a - c, p - c = (a - c) + (b - c).
+inline uint8_t paeth(int a, int b, int c)
 {
-    const int p = a + b - c;
-    const int pa = std::abs(p - a), pb = std::abs(p - b), pc = std::abs(p - c);
-    if (pa <= pb && pa <= pc) return a;
-    return pb <= pc ? b : c;
+    const int pa = std::abs(b - c);
+    const int pb = std::abs(a - c);
+    const int pc = std::abs(a + b - c - c);
+    return (uint8_t)((pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c));
 }
 
-// Undo the per-row PNG filters in place. raw holds h rows of (1 filter byte + stride bytes).
-bool unfilter(uint8_t* raw, int h, size_t stride, size_t bpp)
+// Undo the PNG filter of one row in place (cur and prev both point past the filter byte).
+bool unfilter_row(uint8_t ft, uint8_t* cur, const uint8_t* prev, size_t stride, size_t bpp)
 {
-    std::vector<uint8_t> zero(stride, 0);
-    const uint8_t* prev = zero.data();
-    for (int y = 0; y < h; ++y) {
-        uint8_t* row = raw + (size_t)y * (stride + 1);
-        const uint8_t ft = row[0];
-        uint8_t* cur = row + 1;
-        switch (ft) {
-        case 0:
-            break;
-        case 1:
-            for (size_t i = bpp; i < stride; ++i) cur[i] = (uint8_t)(cur[i] + cur[i - bpp]);
-            break;
-        case 2:
-            for (size_t i = 0; i < stride; ++i) cur[i] = (uint8_t)(cur[i] + prev[i]);
-            break;
-        case 3:
-            for (size_t i = 0; i < bpp && i < stride; ++i) cur[i] = (uint8_t)(cur[i] + (prev[i] >> 1));
-            for (size_t i = bpp; i < stride; ++i)
-                cur[i] = (uint8_t)(cur[i] + (((int)cur[i - bpp] + (int)prev[i]) >> 1));
-            break;
-        case 4:
-            for (size_t i = 0; i < bpp && i < stride; ++i) cur[i] = (uint8_t)(cur[i] + prev[i]);
+    switch (ft) {
+    case 0:
+        return true;
+    case 1:
+        for (size_t i = bpp; i < stride; ++i) cur[i] = (uint8_t)(cur[i] + cur[i - bpp]);
+        return true;
+    case 2:
+        for (size_t i = 0; i < stride; ++i) cur[i] = (uint8_t)(cur[i] + prev[i]);
+        return true;
+    case 3:
+        for (size_t i = 0; i < bpp && i < stride; ++i) cur[i] = (uint8_t)(cur[i] + (prev[i] >> 1));
+        for (size_t i = bpp; i < stride; ++i)
+            cur[i] = (uint8_t)(cur[i] + (((int)cur[i - bpp] + (int)prev[i]) >> 1));
+        return true;
+    case 4: {
+        for (size_t i = 0; i < bpp && i < stride; ++i) cur[i] = (uint8_t)(cur[i] + prev[i]);
+        if (bpp == 3) {
+            // keep the left and upper-left pixels in registers
+            int a0 = cur[0], a1 = cur[1], a2 = cur[2];
+            int c0 = prev[0], c1 = prev[1], c2 = prev[2];
+            for (size_t i = 3; i + 3 <= stride; i += 3) {
+                const int b0 = prev[i], b1 = prev[i + 1], b2 = prev[i + 2];
+                a0 = cur[i] = (uint8_t)(cur[i] + paeth(a0, b0, c0));
+                a1 = cur[i + 1] = (uint8_t)(cur[i + 1] + paeth(a1, b1, c1));
+                a2 = cur[i + 2] = (uint8_t)(cur[i + 2] + paeth(a2, b2, c2));
+                c0 = b0; c1 = b1; c2 = b2;
+            }
+        } else if (bpp == 4) {
+            int a0 = cur[0], a1 = cur[1], a2 = cur[2], a3 = cur[3];
+            int c0 = prev[0], c1 = prev[1], c2 = prev[2], c3 = prev[3];
+            for (size_t i = 4; i + 4 <= stride; i += 4) {
+                const int b0 = prev[i], b1 = prev[i + 1], b2 = prev[i + 2], b3 = prev[i + 3];
+                a0 = cur[i] = (uint8_t)(cur[i] + paeth(a0, b0, c0));
+                a1 = cur[i + 1] = (uint8_t)(cur[i + 1] + paeth(a1, b1, c1));
+                a2 = cur[i + 2] = (uint8_t)(cur[i + 2] + paeth(a2, b2, c2));
+                a3 = cur[i + 3] = (uint8_t)(cur[i + 3] + paeth(a3, b3, c3));
+                c0 = b0; c1 = b1; c2 = b2; c3 = b3;
+            }
+        } else {
             for (size_t i = bpp; i < stride; ++i)
                 cur[i] = (uint8_t)(cur[i] + paeth(cur[i - bpp], prev[i], prev[i - bpp]));
-            break;
-        default:
-            return false;
         }
-        prev = cur;
+        return true;
     }
-    return true;
+    default:
+        return false;
+    }
 }
 
 struct Fmt {
@@ -307,15 +324,20 @@ bool decode_png_fast(const std::vector<uint8_t>& file, Image& out)
         actual != raw.size())
         return false;
 
-    if (!unfilter(raw.data(), (int)h, stride, bpp))
-        return false;
-
     out.w = (int)w;
     out.h = (int)h;
     out.rgba.resize((size_t)w * h * 4);
-    Fmt f = {(int)w, (int)h, ct, bd, plte, nplte, trns, ntrns};
-    for (uint32_t y = 0; y < h; ++y)
-        convert_row(raw.data() + (size_t)y * (stride + 1) + 1, f, out.rgba.data() + (size_t)y * w * 4);
+    const Fmt f = {(int)w, (int)h, ct, bd, plte, nplte, trns, ntrns};
+    // unfilter and convert one row at a time so the row is still in cache for the conversion
+    std::vector<uint8_t> zero(stride, 0);
+    const uint8_t* prev = zero.data();
+    for (uint32_t y = 0; y < h; ++y) {
+        uint8_t* row = raw.data() + (size_t)y * (stride + 1);
+        if (!unfilter_row(row[0], row + 1, prev, stride, bpp))
+            return false;
+        convert_row(row + 1, f, out.rgba.data() + (size_t)y * w * 4);
+        prev = row + 1;
+    }
     finish_alpha(out);
     return true;
 }
