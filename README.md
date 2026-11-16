@@ -42,7 +42,9 @@ One process, one GL context, one compiled shader per (block size, alpha) combina
 threads decode PNGs (`-j N`, default cores - 1) while the GL thread encodes. Images up to
 512x512 are packed: images with the same block size, alpha mode and padded width are stacked
 into one tall texture (each padded to whole blocks with replicated edge pixels) and encoded in
-a single dispatch, then each image's blocks are sliced out. Larger images are encoded one by one.
+a single dispatch, then each image's blocks are sliced out. Larger images are encoded one by one. Finished files are saved by a separate writer thread, so
+slow storage (SD cards) overlaps with encoding. `-update` skips any PNG whose `.astc` already exists
+and is not older, so re-running a folder only converts what changed.
 `tests/pack_test.py` checks the packing on the desktop GPU (each stacked image must encode
 identically to the image on its own).
 

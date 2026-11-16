@@ -51,6 +51,7 @@ void usage()
         "  -alpha auto|on|off  encode alpha (default auto: on if any alpha < 255)\n"
         "  -norm             normal map (B and A forced to 1)\n"
         "  -j N              decoder threads in batch mode (default: cores - 1)\n"
+        "  -update           skip files whose .astc is already newer than the .png\n"
         "  -upload           also upload the result into an ASTC texture on the GPU (self-test)\n"
         "  -v                verbose\n");
 }
@@ -62,6 +63,7 @@ struct Cli {
     bool upload = false;
     bool verbose = false;
     int threads = 0;
+    bool update = false; // skip up-to-date outputs
     bool batch = false;
     std::string in, out;
 };
@@ -119,28 +121,39 @@ struct Job {
     bool alpha = false;
 };
 
-class JobQueue {
-public:
-    explicit JobQueue(size_t max_bytes) : max_bytes_(max_bytes) {}
+struct WriteJob {
+    std::string path;
+    int block = 4, w = 0, h = 0;
+    std::vector<uint8_t> data;
+};
 
-    void push(Job&& j)
+inline size_t byte_size(const Job& j) { return j.img.rgba.size(); }
+inline size_t byte_size(const WriteJob& j) { return j.data.size(); }
+
+// Blocking queue that holds at most max_bytes of payload (but always accepts one item).
+template <class T>
+class BoundedQueue {
+public:
+    explicit BoundedQueue(size_t max_bytes) : max_bytes_(max_bytes) {}
+
+    void push(T&& j)
     {
         std::unique_lock<std::mutex> lk(m_);
-        const size_t sz = j.img.rgba.size();
+        const size_t sz = byte_size(j);
         not_full_.wait(lk, [&] { return bytes_ == 0 || bytes_ + sz <= max_bytes_; });
         bytes_ += sz;
         q_.push_back(std::move(j));
         not_empty_.notify_one();
     }
 
-    bool pop(Job& j)
+    bool pop(T& j)
     {
         std::unique_lock<std::mutex> lk(m_);
         not_empty_.wait(lk, [&] { return !q_.empty() || closed_; });
         if (q_.empty()) return false;
         j = std::move(q_.front());
         q_.pop_front();
-        bytes_ -= j.img.rgba.size();
+        bytes_ -= byte_size(j);
         not_full_.notify_all();
         return true;
     }
@@ -155,11 +168,14 @@ public:
 private:
     std::mutex m_;
     std::condition_variable not_empty_, not_full_;
-    std::deque<Job> q_;
+    std::deque<T> q_;
     size_t bytes_ = 0;
     const size_t max_bytes_;
     bool closed_ = false;
 };
+
+typedef BoundedQueue<Job> JobQueue;
+typedef BoundedQueue<WriteJob> WriteQueue;
 
 // ---------------------------------------------------------------------------
 // GL side
@@ -180,12 +196,13 @@ bool has_extension(const char* name)
 struct Gpu {
     std::map<std::pair<int, int>, std::unique_ptr<gpuastc::Encoder>> encoders; // (block, alpha)
     GLuint tex = 0, buf = 0;
+    WriteQueue* writer = nullptr; // finished files go here; a writer thread saves them
     int max_height = 4096; // tallest atlas we build
     int max_tex = 2048;
     bool normal = false, upload = false, verbose = false;
 
     // statistics
-    double ms_gpu = 0, ms_write = 0;
+    double ms_gpu = 0;
     long long pixels = 0, bytes_out = 0;
     int files_ok = 0, files_failed = 0, dispatches = 0;
 
@@ -308,18 +325,19 @@ bool flush_pack(Gpu& g, Pack& p)
         const Job& j = p.jobs[k];
         const size_t first = single ? 0 : (size_t)(p.row0[k] / block) * bx * 16;
         const size_t size = (size_t)gpuastc::Encoder::blocks(j.img.h, block) * bx * 16;
-        if (write_astc(j.out_path, block, j.img.w, j.img.h, mapped + first, size)) {
-            ++g.files_ok;
-            g.pixels += (long long)j.img.w * j.img.h;
-            g.bytes_out += (long long)size + 16;
-            if (g.verbose && p.jobs.size() == 1)
-                std::printf("%s: %dx%d -> %dx%d blocks of %dx%d\n", j.out_path.c_str(), j.img.w, j.img.h, bx, by, block, block);
-        } else {
-            std::fprintf(stderr, "cannot write %s\n", j.out_path.c_str());
-            ++g.files_failed;
-        }
+        WriteJob wj;
+        wj.path = j.out_path;
+        wj.block = block;
+        wj.w = j.img.w;
+        wj.h = j.img.h;
+        wj.data.assign(mapped + first, mapped + first + size);
+        g.writer->push(std::move(wj)); // saved on the writer thread, overlapping the next dispatch
+        ++g.files_ok;
+        g.pixels += (long long)j.img.w * j.img.h;
+        g.bytes_out += (long long)size + 16;
+        if (g.verbose && p.jobs.size() == 1)
+            std::printf("%s: %dx%d -> %dx%d blocks of %dx%d\n", j.out_path.c_str(), j.img.w, j.img.h, bx, by, block, block);
     }
-    g.ms_write += now_ms() - t1;
     glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
 
     if (g.upload && single) {
@@ -380,6 +398,7 @@ int main(int argc, char** argv)
             cli.alpha_mode = !std::strcmp(v, "on") ? 1 : !std::strcmp(v, "off") ? 2 : 0;
         }
         else if (!std::strcmp(argv[i], "-j") && i + 1 < argc) cli.threads = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "-update")) cli.update = true;
         else if (!std::strcmp(argv[i], "-norm")) cli.normal = true;
         else if (!std::strcmp(argv[i], "-upload")) cli.upload = true;
         else if (!std::strcmp(argv[i], "-v")) cli.verbose = true;
@@ -436,8 +455,24 @@ int main(int argc, char** argv)
     nthreads = std::min<int>(nthreads, (int)files.size());
 
     JobQueue queue(256u << 20); // at most ~256 MB of decoded pixels waiting
+    WriteQueue write_queue(64u << 20); // and ~64 MB of finished blocks waiting to be saved
+    gpu.writer = &write_queue;
+    std::atomic<int> write_failed(0);
+    double write_ms = 0; // only touched by the writer thread until it is joined
+    std::thread writer([&]() {
+        WriteJob wj;
+        while (write_queue.pop(wj)) {
+            const double t0 = now_ms();
+            if (!write_astc(wj.path, wj.block, wj.w, wj.h, wj.data.data(), wj.data.size())) {
+                std::fprintf(stderr, "cannot write %s%s", wj.path.c_str(), "\n");
+                ++write_failed;
+            }
+            write_ms += now_ms() - t0;
+        }
+    });
     std::atomic<size_t> next(0);
     std::atomic<int> decode_failed(0);
+    std::atomic<int> skipped(0);
     std::atomic<int> running(nthreads);
     std::vector<double> decode_ms(nthreads, 0.0);
     std::vector<std::thread> workers;
@@ -447,6 +482,14 @@ int main(int argc, char** argv)
             for (;;) {
                 const size_t i = next.fetch_add(1);
                 if (i >= files.size()) break;
+                if (cli.update) { // output already there and not older than the input: nothing to do
+                    struct stat st_in, st_out;
+                    if (stat(files[i].first.c_str(), &st_in) == 0 && stat(files[i].second.c_str(), &st_out) == 0 &&
+                        st_out.st_size > 16 && st_out.st_mtime >= st_in.st_mtime) {
+                        ++skipped;
+                        continue;
+                    }
+                }
                 Job j;
                 std::string err;
                 const double t0 = now_ms();
@@ -494,17 +537,21 @@ int main(int argc, char** argv)
     }
     for (auto& kv : packs) flush_pack(gpu, kv.second);
     for (std::thread& t : workers) t.join();
+    write_queue.close();
+    writer.join();
+    gpu.files_ok -= write_failed.load();
+    gpu.files_failed += write_failed.load();
     const double wall = now_ms() - wall0;
     gpu.files_failed += decode_failed.load();
 
     double dec_total = 0;
     for (double d : decode_ms) dec_total += d;
     if (cli.batch || cli.verbose) {
-        std::printf("%d files converted, %d failed, %.2f Mpx in %.0f ms (%.1f files/s, %.1f Mpx/s)\n",
-                    gpu.files_ok, gpu.files_failed, gpu.pixels / 1e6, wall,
+        std::printf("%d files converted, %d up to date (skipped), %d failed, %.2f Mpx in %.0f ms (%.1f files/s, %.1f Mpx/s)\n",
+                    gpu.files_ok, skipped.load(), gpu.files_failed, gpu.pixels / 1e6, wall,
                     wall > 0 ? gpu.files_ok * 1000.0 / wall : 0.0, wall > 0 ? gpu.pixels / 1e3 / wall : 0.0);
-        std::printf("  decode %.0f ms across %d thread(s), GPU upload+encode+readback %.0f ms in %d dispatch(es), file writes %.0f ms, output %.1f MB\n",
-                    dec_total, nthreads, gpu.ms_gpu, gpu.dispatches, gpu.ms_write, gpu.bytes_out / 1e6);
+        std::printf("  decode %.0f ms across %d thread(s), GPU upload+encode+readback %.0f ms in %d dispatch(es), file writes %.0f ms (own thread), output %.1f MB\n",
+                    dec_total, nthreads, gpu.ms_gpu, gpu.dispatches, write_ms, gpu.bytes_out / 1e6);
     } else if (gpu.files_ok == 1) {
         std::printf("%s: written in %.2f ms (GPU %.2f ms)\n", files[0].second.c_str(), wall, gpu.ms_gpu);
     }
