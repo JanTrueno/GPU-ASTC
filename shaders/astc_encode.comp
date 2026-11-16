@@ -1,0 +1,453 @@
+// GPU-ASTC: ASTC LDR block encoder, OpenGL ES 3.1 compute shader.
+//
+// The host prepends "#version 310 es" and the option defines below, then
+// astc_tables.glsl, then this file.
+//
+// Derived from niepp/astc_encoder (MIT, Copyright (c) 2021 niedap),
+// ported from HLSL. See THIRD_PARTY_NOTICES.md.
+//
+// One invocation encodes one block: single partition, single plane,
+// 4x4 weight grid, RGB or RGBA direct endpoints (8 bit, unquantized).
+
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+
+#ifndef BLOCK_6X6
+#define BLOCK_6X6 0
+#endif
+#ifndef HAS_ALPHA
+#define HAS_ALPHA 0
+#endif
+#ifndef IS_NORMALMAP
+#define IS_NORMALMAP 0
+#endif
+
+#if BLOCK_6X6
+#define DIM 6
+#else
+#define DIM 4
+#endif
+
+#define BLOCK_SIZE ((DIM) * (DIM))
+#define X_GRIDS 4
+#define Y_GRIDS 4
+#define SMALL_VALUE 0.00001
+
+#define CEM_LDR_RGB_DIRECT 8u
+#define CEM_LDR_RGBA_DIRECT 12u
+
+#define QUANT_6 4
+#define QUANT_12 7
+#define QUANT_256 20
+#define WEIGHT_QUANTIZE_NUM 32
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+uniform ivec2 uTexSize;   // source size in texels
+uniform ivec2 uBlocks;    // size in blocks
+layout(binding = 0) uniform highp sampler2D uTex;
+layout(std430, binding = 0) writeonly buffer OutBuffer { uvec4 blocks[]; };
+
+// ---------------------------------------------------------------------------
+// bit packing (bounded integer sequence encoding)
+// ---------------------------------------------------------------------------
+
+// Or the low bitcount bits of number into o at bitoffset. number <= 255.
+void orbits8_ptr(inout uvec4 o, inout uint bitoffset, uint number, uint bitcount)
+{
+    uint newpos = bitoffset + bitcount;
+    uint uidx = bitoffset >> 5u;
+    uint nidx = newpos >> 5u;
+    uint sh = bitoffset & 31u;
+    uint lo = number << sh;
+    uint hi = (nidx > uidx) ? (number >> ((32u - sh) & 31u)) : 0u;
+    if (uidx == 0u)      { o.x |= lo; o.y |= hi; }
+    else if (uidx == 1u) { o.y |= lo; o.z |= hi; }
+    else if (uidx == 2u) { o.z |= lo; o.w |= hi; }
+    else                 { o.w |= lo; }
+    bitoffset = newpos;
+}
+
+void split_high_low(uint n, uint i, out int high, out uint low)
+{
+    uint mask = (1u << i) - 1u;
+    low = n & mask;
+    high = int((n >> i) & 0xFFu);
+}
+
+uint reverse_byte(uint p)
+{
+    p = ((p & 0xFu) << 4u) | ((p >> 4u) & 0xFu);
+    p = ((p & 0x33u) << 2u) | ((p >> 2u) & 0x33u);
+    p = ((p & 0x55u) << 1u) | ((p >> 1u) & 0x55u);
+    return p;
+}
+
+void encode_trits(uint bitcount, uint b0, uint b1, uint b2, uint b3, uint b4,
+                  inout uvec4 outputs, inout uint outpos)
+{
+    int t0, t1, t2, t3, t4;
+    uint m0, m1, m2, m3, m4;
+    split_high_low(b0, bitcount, t0, m0);
+    split_high_low(b1, bitcount, t1, m1);
+    split_high_low(b2, bitcount, t2, m2);
+    split_high_low(b3, bitcount, t3, m3);
+    split_high_low(b4, bitcount, t4, m4);
+
+    uint packhigh = uint(integer_from_trits[t4 * 81 + t3 * 27 + t2 * 9 + t1 * 3 + t0]);
+
+    orbits8_ptr(outputs, outpos, m0, bitcount);
+    orbits8_ptr(outputs, outpos, packhigh & 3u, 2u);
+    orbits8_ptr(outputs, outpos, m1, bitcount);
+    orbits8_ptr(outputs, outpos, (packhigh >> 2u) & 3u, 2u);
+    orbits8_ptr(outputs, outpos, m2, bitcount);
+    orbits8_ptr(outputs, outpos, (packhigh >> 4u) & 1u, 1u);
+    orbits8_ptr(outputs, outpos, m3, bitcount);
+    orbits8_ptr(outputs, outpos, (packhigh >> 5u) & 3u, 2u);
+    orbits8_ptr(outputs, outpos, m4, bitcount);
+    orbits8_ptr(outputs, outpos, (packhigh >> 7u) & 1u, 1u);
+}
+
+void encode_quints(uint bitcount, uint b0, uint b1, uint b2,
+                   inout uvec4 outputs, inout uint outpos)
+{
+    int q0, q1, q2;
+    uint m0, m1, m2;
+    split_high_low(b0, bitcount, q0, m0);
+    split_high_low(b1, bitcount, q1, m1);
+    split_high_low(b2, bitcount, q2, m2);
+
+    uint packhigh = uint(integer_from_quints[q2 * 25 + q1 * 5 + q0]);
+
+    orbits8_ptr(outputs, outpos, m0, bitcount);
+    orbits8_ptr(outputs, outpos, packhigh & 7u, 3u);
+    orbits8_ptr(outputs, outpos, m1, bitcount);
+    orbits8_ptr(outputs, outpos, (packhigh >> 3u) & 3u, 2u);
+    orbits8_ptr(outputs, outpos, m2, bitcount);
+    orbits8_ptr(outputs, outpos, (packhigh >> 5u) & 3u, 2u);
+}
+
+void bise_endpoints(uint numbers[8], int range, inout uvec4 outputs)
+{
+    uint bitpos = 0u;
+    uint bits = uint(bits_trits_quints_table[range * 3 + 0]);
+    int trits = bits_trits_quints_table[range * 3 + 1];
+    int quints = bits_trits_quints_table[range * 3 + 2];
+#if HAS_ALPHA
+    int count = 8;
+#else
+    int count = 6;
+#endif
+
+    if (trits == 1)
+    {
+        encode_trits(bits, numbers[0], numbers[1], numbers[2], numbers[3], numbers[4], outputs, bitpos);
+        encode_trits(bits, numbers[5], numbers[6], numbers[7], 0u, 0u, outputs, bitpos);
+    }
+    else if (quints == 1)
+    {
+        encode_quints(bits, numbers[0], numbers[1], numbers[2], outputs, bitpos);
+        encode_quints(bits, numbers[3], numbers[4], numbers[5], outputs, bitpos);
+        encode_quints(bits, numbers[6], numbers[7], 0u, outputs, bitpos);
+    }
+    else
+    {
+        for (int i = 0; i < count; ++i)
+            orbits8_ptr(outputs, bitpos, numbers[i], bits);
+    }
+}
+
+void bise_weights(uint numbers[16], int range, inout uvec4 outputs)
+{
+    uint bitpos = 0u;
+    uint bits = uint(bits_trits_quints_table[range * 3 + 0]);
+    int trits = bits_trits_quints_table[range * 3 + 1];
+    int quints = bits_trits_quints_table[range * 3 + 2];
+
+    if (trits == 1)
+    {
+        encode_trits(bits, numbers[0], numbers[1], numbers[2], numbers[3], numbers[4], outputs, bitpos);
+        encode_trits(bits, numbers[5], numbers[6], numbers[7], numbers[8], numbers[9], outputs, bitpos);
+        encode_trits(bits, numbers[10], numbers[11], numbers[12], numbers[13], numbers[14], outputs, bitpos);
+        encode_trits(bits, numbers[15], 0u, 0u, 0u, 0u, outputs, bitpos);
+    }
+    else if (quints == 1)
+    {
+        encode_quints(bits, numbers[0], numbers[1], numbers[2], outputs, bitpos);
+        encode_quints(bits, numbers[3], numbers[4], numbers[5], outputs, bitpos);
+        encode_quints(bits, numbers[6], numbers[7], numbers[8], outputs, bitpos);
+        encode_quints(bits, numbers[9], numbers[10], numbers[11], outputs, bitpos);
+        encode_quints(bits, numbers[12], numbers[13], numbers[14], outputs, bitpos);
+        encode_quints(bits, numbers[15], 0u, 0u, outputs, bitpos);
+    }
+    else
+    {
+        for (int i = 0; i < 16; ++i)
+            orbits8_ptr(outputs, bitpos, numbers[i], bits);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// endpoints: principal component analysis
+// ---------------------------------------------------------------------------
+
+vec4 eigen_vector(mat4 m)
+{
+    vec4 v = vec4(0.26726, 0.80178, 0.53452, 0.0);
+    for (int i = 0; i < 8; ++i)
+    {
+        v = m * v;
+        if (length(v) < SMALL_VALUE)
+            return v;
+        v = normalize(m * v);
+    }
+    return v;
+}
+
+void find_min_max(vec4 texels[BLOCK_SIZE], vec4 pt_mean, vec4 vec_k, out vec4 e0, out vec4 e1)
+{
+    float a = 1e31;
+    float b = -1e31;
+    for (int i = 0; i < BLOCK_SIZE; ++i)
+    {
+        float t = dot(texels[i] - pt_mean, vec_k);
+        a = min(a, t);
+        b = max(b, t);
+    }
+
+    e0 = clamp(vec_k * a + pt_mean, 0.0, 255.0);
+    e1 = clamp(vec_k * b + pt_mean, 0.0, 255.0);
+
+    // make the first endpoint the darkest one
+    vec4 e0u = round(e0);
+    vec4 e1u = round(e1);
+    if (e0u.x + e0u.y + e0u.z > e1u.x + e1u.y + e1u.z)
+    {
+        vec4 tmp = e0;
+        e0 = e1;
+        e1 = tmp;
+    }
+
+#if !HAS_ALPHA
+    e0.a = 255.0;
+    e1.a = 255.0;
+#endif
+}
+
+void principal_component_analysis(vec4 texels[BLOCK_SIZE], out vec4 e0, out vec4 e1)
+{
+    vec4 pt_mean = vec4(0.0);
+    for (int i = 0; i < BLOCK_SIZE; ++i)
+        pt_mean += texels[i];
+    pt_mean /= float(BLOCK_SIZE);
+
+    mat4 cov = mat4(0.0);
+    for (int k = 0; k < BLOCK_SIZE; ++k)
+    {
+        vec4 t = texels[k] - pt_mean;
+        cov += outerProduct(t, t);
+    }
+    cov /= float(BLOCK_SIZE - 1);
+
+    vec4 vec_k = eigen_vector(cov);
+    find_min_max(texels, pt_mean, vec_k, e0, e1);
+}
+
+// 8 bit endpoints, no quantization (QUANT_256)
+void encode_color(vec4 e0, vec4 e1, out uint q[8])
+{
+    uvec4 a = uvec4(round(e0));
+    uvec4 b = uvec4(round(e1));
+    q[0] = a.r; q[1] = b.r;
+    q[2] = a.g; q[3] = b.g;
+    q[4] = a.b; q[5] = b.b;
+    q[6] = a.a; q[7] = b.a;
+}
+
+// ---------------------------------------------------------------------------
+// weights
+// ---------------------------------------------------------------------------
+
+uint quantize_weight(uint weight_range, float weight)
+{
+    uint q = uint(round(max(weight, 0.0) * float(weight_range)));
+    return min(q, weight_range);
+}
+
+const uvec4 idx_grids[16] = uvec4[16](
+    uvec4(0u, 1u, 6u, 7u),     uvec4(1u, 2u, 7u, 8u),
+    uvec4(3u, 4u, 9u, 10u),    uvec4(4u, 5u, 10u, 11u),
+    uvec4(6u, 7u, 12u, 13u),   uvec4(7u, 8u, 13u, 14u),
+    uvec4(9u, 10u, 15u, 16u),  uvec4(10u, 11u, 16u, 17u),
+    uvec4(18u, 19u, 24u, 25u), uvec4(19u, 20u, 25u, 26u),
+    uvec4(21u, 22u, 27u, 28u), uvec4(22u, 23u, 28u, 29u),
+    uvec4(24u, 25u, 30u, 31u), uvec4(25u, 26u, 31u, 32u),
+    uvec4(27u, 28u, 33u, 34u), uvec4(28u, 29u, 34u, 35u)
+);
+
+const vec4 wt_grids[16] = vec4[16](
+    vec4(0.444, 0.222, 0.222, 0.111), vec4(0.222, 0.444, 0.111, 0.222),
+    vec4(0.444, 0.222, 0.222, 0.111), vec4(0.222, 0.444, 0.111, 0.222),
+    vec4(0.222, 0.111, 0.444, 0.222), vec4(0.111, 0.222, 0.222, 0.444),
+    vec4(0.222, 0.111, 0.444, 0.222), vec4(0.111, 0.222, 0.222, 0.444),
+    vec4(0.444, 0.222, 0.222, 0.111), vec4(0.222, 0.444, 0.111, 0.222),
+    vec4(0.444, 0.222, 0.222, 0.111), vec4(0.222, 0.444, 0.111, 0.222),
+    vec4(0.222, 0.111, 0.444, 0.222), vec4(0.111, 0.222, 0.222, 0.444),
+    vec4(0.222, 0.111, 0.444, 0.222), vec4(0.111, 0.222, 0.222, 0.444)
+);
+
+void calculate_normal_weights(vec4 texels[BLOCK_SIZE], vec4 ep0, vec4 ep1, out float projw[X_GRIDS * Y_GRIDS])
+{
+    vec4 vec_k = ep1 - ep0;
+    if (length(vec_k) < SMALL_VALUE)
+    {
+        for (int i = 0; i < X_GRIDS * Y_GRIDS; ++i)
+            projw[i] = 0.0;
+        return;
+    }
+
+    vec_k = normalize(vec_k);
+    float minw = 1e31;
+    float maxw = -1e31;
+    for (int i = 0; i < X_GRIDS * Y_GRIDS; ++i)
+    {
+#if BLOCK_6X6
+        // bilinear resample of the 6x6 block onto the 4x4 weight grid
+        uvec4 idx = idx_grids[i];
+        vec4 c = wt_grids[i];
+        vec4 sum = texels[idx.x] * c.x + texels[idx.y] * c.y
+                 + texels[idx.z] * c.z + texels[idx.w] * c.w;
+#else
+        vec4 sum = texels[i];
+#endif
+        float w = dot(vec_k, sum - ep0);
+        minw = min(w, minw);
+        maxw = max(w, maxw);
+        projw[i] = w;
+    }
+
+    float invlen = 1.0 / max(SMALL_VALUE, maxw - minw);
+    for (int i = 0; i < X_GRIDS * Y_GRIDS; ++i)
+        projw[i] = (projw[i] - minw) * invlen;
+}
+
+// ---------------------------------------------------------------------------
+// block assembly
+// ---------------------------------------------------------------------------
+
+uvec4 assemble_block(uint blockmode, uint color_endpoint_mode, uvec4 ep_ise, uvec4 wt_ise)
+{
+    uvec4 blk = uvec4(0u);
+
+    // weights are stored bit-reversed from the end of the block
+    blk.w |= reverse_byte(wt_ise.x & 0xFFu) << 24u;
+    blk.w |= reverse_byte((wt_ise.x >> 8u) & 0xFFu) << 16u;
+    blk.w |= reverse_byte((wt_ise.x >> 16u) & 0xFFu) << 8u;
+    blk.w |= reverse_byte((wt_ise.x >> 24u) & 0xFFu);
+
+    blk.z |= reverse_byte(wt_ise.y & 0xFFu) << 24u;
+    blk.z |= reverse_byte((wt_ise.y >> 8u) & 0xFFu) << 16u;
+    blk.z |= reverse_byte((wt_ise.y >> 16u) & 0xFFu) << 8u;
+    blk.z |= reverse_byte((wt_ise.y >> 24u) & 0xFFu);
+
+    blk.y |= reverse_byte(wt_ise.z & 0xFFu) << 24u;
+    blk.y |= reverse_byte((wt_ise.z >> 8u) & 0xFFu) << 16u;
+    blk.y |= reverse_byte((wt_ise.z >> 16u) & 0xFFu) << 8u;
+    blk.y |= reverse_byte((wt_ise.z >> 24u) & 0xFFu);
+
+    blk.x = blockmode;                          // 11 bits
+    blk.x |= (color_endpoint_mode & 0xFu) << 13u; // 4 bits, single partition
+
+    // endpoints start at bit 17 for a single partition
+    blk.x |= (ep_ise.x & 0x7FFFu) << 17u;
+    blk.y |= (ep_ise.x >> 15u) & 0x1FFFFu;
+    blk.y |= (ep_ise.y & 0x7FFFu) << 17u;
+    blk.z |= (ep_ise.y >> 15u) & 0x1FFFFu;
+    return blk;
+}
+
+// "Table C.2.8 - 2D Block Mode Layout", first row.
+uint assemble_blockmode(uint weight_quantmethod)
+{
+    uint a = uint(Y_GRIDS - 2) & 3u;
+    uint b = uint(X_GRIDS - 4) & 3u;
+    uint d = 0u; // dual plane
+    uint h = (weight_quantmethod < 6u) ? 0u : 1u;
+    uint r = (weight_quantmethod % 6u) + 2u;
+
+    uint blockmode = (r >> 1u) & 3u;
+    blockmode |= (r & 1u) << 4u;
+    blockmode |= a << 5u;
+    blockmode |= b << 7u;
+    blockmode |= h << 9u;
+    blockmode |= d << 10u;
+    return blockmode;
+}
+
+uvec4 encode_block(vec4 texels[BLOCK_SIZE])
+{
+    vec4 ep0, ep1;
+    principal_component_analysis(texels, ep0, ep1);
+
+    // fixed modes: endpoints 8 bit, weights QUANT_6 (alpha) or QUANT_12 (opaque)
+#if HAS_ALPHA
+    const int weight_quantmethod = QUANT_6;
+    const uint weight_range = 6u;
+    const uint color_endpoint_mode = CEM_LDR_RGBA_DIRECT;
+#else
+    const int weight_quantmethod = QUANT_12;
+    const uint weight_range = 12u;
+    const uint color_endpoint_mode = CEM_LDR_RGB_DIRECT;
+#endif
+
+    uint blockmode = assemble_blockmode(uint(weight_quantmethod));
+
+    // endpoints
+    uint ep_q[8];
+    encode_color(ep0, ep1, ep_q);
+#if !HAS_ALPHA
+    ep_q[6] = 0u;
+    ep_q[7] = 0u;
+#endif
+    uvec4 ep_ise = uvec4(0u);
+    bise_endpoints(ep_q, QUANT_256, ep_ise);
+
+    // weights
+    float projw[X_GRIDS * Y_GRIDS];
+    calculate_normal_weights(texels, ep0, ep1, projw);
+    uint wt_q[X_GRIDS * Y_GRIDS];
+    for (int i = 0; i < X_GRIDS * Y_GRIDS; ++i)
+    {
+        uint q = quantize_weight(weight_range - 1u, projw[i]);
+        wt_q[i] = uint(scramble_table[weight_quantmethod * WEIGHT_QUANTIZE_NUM + int(q)]);
+    }
+    uvec4 wt_ise = uvec4(0u);
+    bise_weights(wt_q, weight_quantmethod, wt_ise);
+
+    return assemble_block(blockmode, color_endpoint_mode, ep_ise, wt_ise);
+}
+
+void main()
+{
+    ivec2 b = ivec2(gl_GlobalInvocationID.xy);
+    if (b.x >= uBlocks.x || b.y >= uBlocks.y)
+        return;
+
+    vec4 texels[BLOCK_SIZE];
+    for (int k = 0; k < BLOCK_SIZE; ++k)
+    {
+        int y = k / DIM;
+        int x = k - y * DIM;
+        // replicate edge texels for partial blocks
+        ivec2 p = min(b * DIM + ivec2(x, y), uTexSize - ivec2(1));
+        vec4 t = texelFetch(uTex, p, 0);
+#if IS_NORMALMAP
+        t.b = 1.0;
+        t.a = 1.0;
+#endif
+        texels[k] = t * 255.0;
+    }
+
+    blocks[b.y * uBlocks.x + b.x] = encode_block(texels);
+}

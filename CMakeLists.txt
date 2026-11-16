@@ -1,0 +1,31 @@
+cmake_minimum_required(VERSION 3.13)
+project(GPU-ASTC CXX)
+
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# Embed the compute shader (tables + encoder) as a string, regenerated on reconfigure.
+set(SHADER_FILES shaders/astc_tables.glsl shaders/astc_encode.comp)
+set(SHADER_SOURCE "")
+foreach(f ${SHADER_FILES})
+  file(READ ${CMAKE_CURRENT_SOURCE_DIR}/${f} content)
+  string(APPEND SHADER_SOURCE "${content}\n")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${f})
+endforeach()
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/shader_source.h
+  "#pragma once\nnamespace gpuastc { static const char* const kShaderSource = R\"GLSL(${SHADER_SOURCE})GLSL\"; }\n")
+
+find_package(SDL2 REQUIRED)
+find_library(GLESV2_LIBRARY NAMES GLESv2 libGLESv2 REQUIRED)
+
+add_executable(gpuastc src/main.cpp src/astc_gles.cpp)
+target_include_directories(gpuastc PRIVATE src third_party ${CMAKE_CURRENT_BINARY_DIR})
+if(TARGET SDL2::SDL2)
+  target_link_libraries(gpuastc PRIVATE SDL2::SDL2 ${GLESV2_LIBRARY})
+else()
+  target_include_directories(gpuastc PRIVATE ${SDL2_INCLUDE_DIRS})
+  target_link_libraries(gpuastc PRIVATE ${SDL2_LIBRARIES} ${GLESV2_LIBRARY})
+endif()
