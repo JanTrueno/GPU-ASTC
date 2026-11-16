@@ -216,12 +216,28 @@ void find_min_max(vec4 pt_mean, vec4 vec_k, out vec4 e0, out vec4 e1)
 #endif
 }
 
-void principal_component_analysis(out vec4 e0, out vec4 e1)
+void principal_component_analysis(out vec4 e0, out vec4 e1, out bool flat_block)
 {
     vec4 pt_mean = vec4(0.0);
+    vec4 tmin = vec4(1e31);
+    vec4 tmax = vec4(-1e31);
     for (int i = 0; i < uN; ++i)
-        pt_mean += texel(i);
+    {
+        vec4 t = texel(i);
+        pt_mean += t;
+        tmin = min(tmin, t);
+        tmax = max(tmax, t);
+    }
     pt_mean /= float(BLOCK_SIZE);
+
+    // Every texel the same colour: skip the covariance, axis and weights (constant-colour block).
+    flat_block = all(equal(tmin, tmax));
+    if (flat_block)
+    {
+        e0 = tmin;
+        e1 = tmin;
+        return;
+    }
 
     // covariance is symmetric: accumulate the 10 unique entries
     float c00 = 0.0, c01 = 0.0, c02 = 0.0, c03 = 0.0, c11 = 0.0, c12 = 0.0, c13 = 0.0, c22 = 0.0, c23 = 0.0, c33 = 0.0;
@@ -473,7 +489,19 @@ uvec4 encode_dual_plane(out float err)
 uvec4 encode_block(out float single_error)
 {
     vec4 ep0, ep1;
-    principal_component_analysis(ep0, ep1);
+    bool flat_block;
+    principal_component_analysis(ep0, ep1, flat_block);
+    if (flat_block)
+    {
+        // Every texel has the same colour: write a constant-colour (void-extent) block. No axis,
+        // weights or bit packing needed, and it is exact. 8 bit -> 16 bit UNORM is a multiply by 257.
+        uvec4 c = uvec4(round(ep0)) * 257u;
+#if !HAS_ALPHA
+        c.a = 65535u;
+#endif
+        single_error = 0.0;
+        return uvec4(0xFFFFFDFCu, 0xFFFFFFFFu, c.r | (c.g << 16u), c.b | (c.a << 16u));
+    }
 
     // fixed modes: endpoints 8 bit, weights QUANT_6 (alpha) or QUANT_12 (opaque)
 #if HAS_ALPHA
