@@ -18,6 +18,9 @@ precision highp sampler2D;
 #ifndef HAS_ALPHA
 #define HAS_ALPHA 0
 #endif
+#ifndef PREMULTIPLIED
+#define PREMULTIPLIED 0 // colour already multiplied by alpha (XNA content): errors count unweighted
+#endif
 #ifndef IS_NORMALMAP
 #define IS_NORMALMAP 0
 #endif
@@ -387,10 +390,23 @@ uint assemble_blockmode(uint weight_quantmethod)
 
 // Error metric used to choose between the encodings: RGB error counts in proportion to the source
 // alpha (the colour under a transparent pixel is invisible), alpha error counts fully.
+float colour_weight(float a)
+{
+#if PREMULTIPLIED
+    return 1.0;
+#else
+    return a + 1.0;
+#endif
+}
+
 float pixel_error(vec4 t, vec4 decoded)
 {
     vec4 d = t - decoded;
+#if PREMULTIPLIED
+    return dot(d, d); // premultiplied: the colour of a transparent pixel is real (black)
+#else
     return (t.a * (1.0 / 255.0)) * dot(d.rgb, d.rgb) + d.a * d.a;
+#endif
 }
 
 uvec4 encode_dual_plane(out float err)
@@ -407,7 +423,7 @@ uvec4 encode_dual_plane(out float err)
         vec4 t = texel(i);
         amin = min(amin, t.a);
         amax = max(amax, t.a);
-        float wt = t.a + 1.0;
+        float wt = colour_weight(t.a);
         msum += wt * t.rgb;
         wsum += wt;
     }
@@ -424,7 +440,7 @@ uvec4 encode_dual_plane(out float err)
     {
         vec4 t = texel(i);
         vec3 d = t.rgb - mean;
-        float wt = t.a + 1.0;
+        float wt = colour_weight(t.a);
         c00 += wt * d.x * d.x; c01 += wt * d.x * d.y; c02 += wt * d.x * d.z;
         c11 += wt * d.y * d.y; c12 += wt * d.y * d.z; c22 += wt * d.z * d.z;
     }
@@ -440,7 +456,7 @@ uvec4 encode_dual_plane(out float err)
     for (int i = 0; i < n; ++i)
     {
         vec4 t = texel(i);
-        float wt = t.a + 1.0;
+        float wt = colour_weight(t.a);
         if (dot(t.rgb - mean, axis) > 0.0) { s1 += wt * t.rgb; w1 += wt; }
         else                               { s0 += wt * t.rgb; w0 += wt; }
     }

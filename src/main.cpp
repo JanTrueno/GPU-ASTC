@@ -62,8 +62,10 @@ void usage()
         "  -norm             normal map (B and A forced to 1)\n"
         "  -j N              decoder threads in batch mode (default: cores - 1)\n"
         "  -prefetch N       read up to N files ahead into the page cache on helper threads (slow storage)\n"
-        "  -update           skip files whose .astc is already newer than the .png\n"
-        "                    (with -pack: reuse unchanged entries from the existing archive)\n"
+        "  -force            convert everything again. By default a file whose output is already newer than\n"
+        "                    the input is skipped (with -pack: unchanged entries are reused from the old\n"
+        "                    archive). Use -force after changing -b, -alpha, -norm or -premult.\n"
+        "  -premult          treat the colour as premultiplied by alpha (always on for .xnb input)\n"
         "  -upload           also upload the result into an ASTC texture on the GPU (self-test)\n"
         "  -v                verbose\n");
 }
@@ -75,7 +77,8 @@ struct Cli {
     bool upload = false;
     bool verbose = false;
     int threads = 0;
-    bool update = false; // skip up-to-date outputs
+    bool update = true;  // skip up-to-date outputs (-force turns this off)
+    bool premult = false; // force premultiplied-alpha handling
     int prefetch = 0;    // read-ahead distance in files (0 = off)
     bool batch = false;
     bool pack = false;   // -pack: write one archive instead of one file per texture
@@ -166,6 +169,7 @@ struct Job {
     gpuastc::Image img;
     int block = 4;
     bool alpha = false;
+    bool premult = false;
     uint64_t src_size = 0, src_mtime = 0; // of the source PNG (for -pack -update)
 };
 
@@ -405,7 +409,7 @@ bool has_extension(const char* name)
 }
 
 struct Gpu {
-    std::map<std::pair<int, int>, std::unique_ptr<gpuastc::Encoder>> encoders; // (block, alpha)
+    std::map<std::pair<int, int>, std::unique_ptr<gpuastc::Encoder>> encoders; // (block, alpha | premult << 1)
     GLuint tex = 0, buf = 0;
     WriteQueue* writer = nullptr; // finished files go here; a writer thread saves them
     int max_height = 4096; // tallest atlas we build
@@ -417,15 +421,16 @@ struct Gpu {
     long long pixels = 0, bytes_out = 0;
     int files_ok = 0, files_failed = 0, dispatches = 0;
 
-    gpuastc::Encoder* encoder(int block, bool alpha)
+    gpuastc::Encoder* encoder(int block, bool alpha, bool premult)
     {
-        auto key = std::make_pair(block, alpha ? 1 : 0);
+        auto key = std::make_pair(block, (alpha ? 1 : 0) | (premult ? 2 : 0));
         auto it = encoders.find(key);
         if (it != encoders.end()) return it->second.get();
         std::unique_ptr<gpuastc::Encoder> e(new gpuastc::Encoder());
         gpuastc::Options o;
         o.block = block;
         o.alpha = alpha;
+        o.premultiplied = premult;
         o.normal_map = normal;
         std::string log;
         if (!e->create(o, &log)) {
@@ -444,6 +449,7 @@ struct Gpu {
 struct Pack {
     int block = 4;
     bool alpha = false;
+    bool premult = false;
     int width = 0;  // padded width
     int height = 0; // total padded height
     long long pixels = 0;
@@ -472,7 +478,7 @@ bool flush_pack(Gpu& g, Pack& p)
     if (p.jobs.empty()) return true;
 
     const int block = p.block;
-    gpuastc::Encoder* enc = g.encoder(block, p.alpha);
+    gpuastc::Encoder* enc = g.encoder(block, p.alpha, p.premult);
     if (!enc) { g.files_failed += (int)p.jobs.size(); p.clear(); return false; }
 
     const bool single = p.jobs.size() == 1;
@@ -615,7 +621,9 @@ int main(int argc, char** argv)
             cli.alpha_mode = !std::strcmp(v, "on") ? 1 : !std::strcmp(v, "off") ? 2 : 0;
         }
         else if (!std::strcmp(argv[i], "-j") && i + 1 < argc) cli.threads = std::atoi(argv[++i]);
-        else if (!std::strcmp(argv[i], "-update")) cli.update = true;
+        else if (!std::strcmp(argv[i], "-update")) cli.update = true; // now the default
+        else if (!std::strcmp(argv[i], "-force")) cli.update = false;
+        else if (!std::strcmp(argv[i], "-premult")) cli.premult = true;
         else if (!std::strcmp(argv[i], "-prefetch") && i + 1 < argc) cli.prefetch = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-norm")) cli.normal = true;
         else if (!std::strcmp(argv[i], "-upload")) cli.upload = true;
@@ -724,7 +732,7 @@ int main(int argc, char** argv)
     std::atomic<size_t> next(0);
     std::atomic<int> decode_failed(0);
     std::atomic<int> skipped(0);
-    std::atomic<int> not_textures(0);
+    std::atomic<int> not_textures(0), unsupported(0), copied(0);
     std::atomic<int> running(nthreads);
     std::vector<double> decode_ms(nthreads, 0.0);
     std::vector<double> read_ms(nthreads, 0.0);
@@ -756,7 +764,7 @@ int main(int argc, char** argv)
                         continue;
                     }
                 }
-                if (cli.update && !cli.pack && files[i].first != files[i].second) { // output already there and not older than the input: nothing to do
+                if (cli.update && cli.batch && !cli.pack && files[i].first != files[i].second) { // output already there and not older than the input: nothing to do
                     struct stat st_in, st_out;
                     if (stat(files[i].first.c_str(), &st_in) == 0 && stat(files[i].second.c_str(), &st_out) == 0 &&
                         st_out.st_size > 16 && st_out.st_mtime >= st_in.st_mtime) {
@@ -774,9 +782,17 @@ int main(int argc, char** argv)
                 const gpuastc::InputFormat* fmt = gpuastc::input_format_for(files[i].first);
                 if (!read_ok || !fmt || !fmt->decode(file_bytes, j.img, &err)) {
                     if (read_ok && err == gpuastc::xnb_already_astc()) { ++skipped; continue; }
-                    if (read_ok && fmt && fmt->writes_same_container && cli.batch && err != "LZX data is corrupt" &&
-                        err.compare(0, 20, "surface format is no") != 0) { // fonts, models, ...: not an error in a game's Content folder
-                        ++not_textures;
+                    if (read_ok && fmt && fmt->writes_same_container && cli.batch) {
+                        // A content file we do not convert (font, sound, model, unsupported texture format):
+                        // carry it over unchanged so the output folder is a complete Content folder.
+                        if (!cli.pack && files[i].first != files[i].second) {
+                            make_parents(files[i].second);
+                            if (write_file_atomic(files[i].second, file_bytes.data(), file_bytes.size())) ++copied;
+                            else { std::fprintf(stderr, "cannot write %s\n", files[i].second.c_str()); ++decode_failed; }
+                        }
+                        const bool real_problem = err == "LZX data is corrupt" || err.compare(0, 20, "surface format is no") == 0;
+                        if (real_problem) { std::fprintf(stderr, "%s: %s (copied unchanged)\n", files[i].first.c_str(), err.c_str()); ++unsupported; }
+                        else ++not_textures;
                         continue;
                     }
                     std::fprintf(stderr, "%s: %s\n", files[i].first.c_str(), err.c_str());
@@ -786,6 +802,7 @@ int main(int argc, char** argv)
                 read_ms[t] += t1 - t0;
                 decode_ms[t] += now_ms() - t1;
                 j.alpha = cli.alpha_mode == 1 || (cli.alpha_mode == 0 && j.img.alpha);
+                j.premult = j.alpha && (cli.premult || j.img.premultiplied);
                 j.block = cli.block ? cli.block : gpuastc::Encoder::pick_block(j.img.w, j.img.h, j.alpha);
                 j.out_path = files[i].second;
                 if (have_src) { j.src_size = (uint64_t)st_src.st_size; j.src_mtime = (uint64_t)st_src.st_mtime; }
@@ -823,7 +840,7 @@ int main(int argc, char** argv)
     }
 
     // GL thread: collect small images into packs, encode big ones directly.
-    std::map<std::tuple<int, bool, int>, Pack> packs;
+    std::map<std::tuple<int, int, int>, Pack> packs; // (block, alpha | premult << 1, padded width)
     long long pending = 0;
     Job job;
     while (queue.pop(job)) {
@@ -832,13 +849,14 @@ int main(int argc, char** argv)
             Pack one;
             one.block = job.block;
             one.alpha = job.alpha;
+            one.premult = job.premult;
             one.add(std::move(job));
             flush_pack(gpu, one);
             continue;
         }
         const int pw = Pack::pad(w, job.block), ph = Pack::pad(h, job.block);
-        Pack& p = packs[std::make_tuple(job.block, job.alpha, pw)];
-        if (p.jobs.empty()) { p.block = job.block; p.alpha = job.alpha; p.width = pw; }
+        Pack& p = packs[std::make_tuple(job.block, (job.alpha ? 1 : 0) | (job.premult ? 2 : 0), pw)];
+        if (p.jobs.empty()) { p.block = job.block; p.alpha = job.alpha; p.premult = job.premult; p.width = pw; }
         if (p.height + ph > gpu.max_height) { pending -= p.pixels; flush_pack(gpu, p); }
         pending += (long long)w * h;
         p.add(std::move(job));
@@ -868,7 +886,9 @@ int main(int argc, char** argv)
     for (double d : decode_ms) dec_total += d;
     for (double d : read_ms) read_total += d;
     if (cli.batch || cli.verbose) {
-        if (not_textures.load()) std::printf("%d .xnb files are not textures (fonts, sounds, ...): left untouched\n", not_textures.load());
+        if (not_textures.load() || unsupported.load())
+            std::printf("%d .xnb files are not textures (fonts, sounds, ...) and %d use an unsupported texture format; %d copied unchanged\n",
+                        not_textures.load(), unsupported.load(), copied.load());
         std::printf("%d files converted, %d up to date (skipped), %d failed, %.2f Mpx in %.0f ms (%.1f files/s, %.1f Mpx/s)\n",
                     gpu.files_ok, skipped.load(), gpu.files_failed, gpu.pixels / 1e6, wall,
                     wall > 0 ? gpu.files_ok * 1000.0 / wall : 0.0, wall > 0 ? gpu.pixels / 1e3 / wall : 0.0);

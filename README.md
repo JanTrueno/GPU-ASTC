@@ -11,14 +11,21 @@ with astcenc. Not yet run on a real Mali device.
 ```bash
 gpuastc in.png out.astc [-v]                 # one file
 gpuastc -batch pngs/ out/ [-update] [-j N]   # every .png in a folder -> out/<name>.astc
-gpuastc -pack pngs/ sprites.astcpak          # all textures in one archive (-update, -unpack supported)
+gpuastc -pack pngs/ sprites.astcpak          # all textures in one archive (-unpack supported)
+gpuastc -batch Content/ Content/             # XNA/FNA .xnb textures -> ASTC .xnb, in place
 ```
+
+`.png` and `.xnb` (LZX-compressed or not, Color format) are read; subfolders are included. XNB output keeps the file name
+and holds ASTC (surface format values 25-28 are **unverified** against a real patched FNA). Non-texture .xnb files are copied
+unchanged when writing to another folder. XNA colour is premultiplied by alpha; the encoder handles that automatically for .xnb
+(`-premult` forces it for PNG). Files whose output is already newer than the input are skipped; `-force` converts everything.
+New input formats: one decode function plus a line in `src/formats.cpp`.
 
 Options: `-b auto|4|5|6` block size (auto: 4x4 up to 256x256, thin textures and anything with alpha;
 5x5 up to 2048x2048; 6x6 above), `-alpha auto|on|off`, `-norm` normal map, `-upload` self-test of the GPU upload.
 
-- **Batch:** one GL context, PNG decoding on worker threads, small images packed into one dispatch,
-  files saved on a separate writer thread. `-update` skips PNGs whose output is already up to date.
+- **Batch:** one GL context, decoding on worker threads, small images packed into one dispatch,
+  files saved on a separate writer thread.
 - **Archive:** `include/astcpak.h` is a header-only C/C++ reader for games you can modify
   (`astcpak_open`, `astcpak_find`, `astcpak_gl_format`). Layout is documented at the top of the header.
 - **Encoder:** single partition with 8-bit endpoints; 4x4 blocks with alpha also try a dual-plane mode
