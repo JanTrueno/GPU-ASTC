@@ -28,8 +28,7 @@ bool Encoder::create(const Options& opt, std::string* log)
     opt_ = opt;
 
     std::string src = "#version 310 es\n";
-    src += "#define BLOCK_DIM " + std::to_string(opt.block) + "
-";
+    src += "#define BLOCK_DIM " + std::to_string(opt.block) + "\n";
     src += std::string("#define HAS_ALPHA ") + (opt.alpha ? "1" : "0") + "\n";
     src += std::string("#define IS_NORMALMAP ") + (opt.normal_map ? "1" : "0") + "\n";
     src += kShaderSource;
