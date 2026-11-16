@@ -142,7 +142,14 @@ void encode_trit_group(uint b0, uint b1, uint b2, uint b3, uint b4,
 #define EIGEN_ITERATIONS 3
 vec4 eigen_vector(mat4 m)
 {
-    vec4 v = vec4(0.26726, 0.80178, 0.53452, 0.0);
+    // Start from the covariance column with the largest variance. A fixed start vector can be
+    // orthogonal to the real axis (for example a block that only varies in alpha, where a start
+    // vector with alpha = 0 is sent to zero and the block is wrongly treated as flat).
+    vec4 v = m[0];
+    float best = m[0][0];
+    if (m[1][1] > best) { v = m[1]; best = m[1][1]; }
+    if (m[2][2] > best) { v = m[2]; best = m[2][2]; }
+    if (m[3][3] > best) { v = m[3]; best = m[3][3]; }
     for (int i = 0; i < EIGEN_ITERATIONS; ++i)
     {
         v = m * v;
