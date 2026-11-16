@@ -10,7 +10,7 @@ import astc_encoder as ae
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 def shader_source(block, alpha, normal=False):
-    body = (ROOT / "shaders/astc_tables.glsl").read_text() + "\n" + (ROOT / "shaders/astc_encode.comp").read_text()
+    body = (ROOT / "shaders/astc_encode.comp").read_text()
     head = f"#version 430\n#define BLOCK_6X6 {int(block == 6)}\n#define HAS_ALPHA {int(alpha)}\n#define IS_NORMALMAP {int(normal)}\n"
     return head + body
 

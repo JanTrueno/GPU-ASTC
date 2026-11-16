@@ -8,7 +8,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Embed the compute shader (tables + encoder) as a string, regenerated on reconfigure.
-set(SHADER_FILES shaders/astc_tables.glsl shaders/astc_encode.comp)
+set(SHADER_FILES shaders/astc_encode.comp)
 set(SHADER_SOURCE "")
 foreach(f ${SHADER_FILES})
   file(READ ${CMAKE_CURRENT_SOURCE_DIR}/${f} content)

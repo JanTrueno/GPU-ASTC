@@ -1,7 +1,6 @@
 // GPU-ASTC: ASTC LDR block encoder, OpenGL ES 3.1 compute shader.
 //
-// The host prepends "#version 310 es" and the option defines below, then
-// astc_tables.glsl, then this file.
+// The host prepends "#version 310 es" and the option defines below.
 //
 // Derived from niepp/astc_encoder (MIT, Copyright (c) 2021 niedap),
 // ported from HLSL. See THIRD_PARTY_NOTICES.md.
@@ -39,8 +38,6 @@ precision highp sampler2D;
 
 #define QUANT_6 4
 #define QUANT_12 7
-#define QUANT_256 20
-#define WEIGHT_QUANTIZE_NUM 32
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -50,8 +47,17 @@ layout(binding = 0) uniform highp sampler2D uTex;
 layout(std430, binding = 0) writeonly buffer OutBuffer { uvec4 blocks[]; };
 
 // ---------------------------------------------------------------------------
-// bit packing (bounded integer sequence encoding)
+// bit packing (bounded integer sequence encoding), specialised for the fixed modes:
+//   endpoints: 8 bits each (QUANT_256), no trits/quints
+//   weights:   QUANT_12 (2 bits + trit) opaque, QUANT_6 (1 bit + trit) with alpha
+// Everything is pure arithmetic: no lookup tables, so nothing is spilled to memory.
 // ---------------------------------------------------------------------------
+
+#if HAS_ALPHA
+#define WT_BITS 1u
+#else
+#define WT_BITS 2u
+#endif
 
 // Or the low bitcount bits of number into o at bitoffset. number <= 255.
 void orbits8_ptr(inout uvec4 o, inout uint bitoffset, uint number, uint bitcount)
@@ -69,13 +75,6 @@ void orbits8_ptr(inout uvec4 o, inout uint bitoffset, uint number, uint bitcount
     bitoffset = newpos;
 }
 
-void split_high_low(uint n, uint i, out int high, out uint low)
-{
-    uint mask = (1u << i) - 1u;
-    low = n & mask;
-    high = int((n >> i) & 0xFFu);
-}
-
 uint reverse_byte(uint p)
 {
     p = ((p & 0xFu) << 4u) | ((p >> 4u) & 0xFu);
@@ -84,108 +83,64 @@ uint reverse_byte(uint p)
     return p;
 }
 
-void encode_trits(uint bitcount, uint b0, uint b1, uint b2, uint b3, uint b4,
-                  inout uvec4 outputs, inout uint outpos)
+// Weight scramble for QUANT_12 / QUANT_6, as packed 4 bit entries.
+uint scramble_weight(uint q)
 {
-    int t0, t1, t2, t3, t4;
-    uint m0, m1, m2, m3, m4;
-    split_high_low(b0, bitcount, t0, m0);
-    split_high_low(b1, bitcount, t1, m1);
-    split_high_low(b2, bitcount, t2, m2);
-    split_high_low(b3, bitcount, t3, m3);
-    split_high_low(b4, bitcount, t4, m4);
+#if HAS_ALPHA
+    return (0x135420u >> (q * 4u)) & 15u;                    // {0,2,4,5,3,1}
+#else
+    uint v = (q < 8u) ? (0x7BA62840u >> (q * 4u))            // {0,4,8,2,6,10,11,7,3,9,5,1}
+                      : (0x1593u >> ((q - 8u) * 4u));
+    return v & 15u;
+#endif
+}
 
-    uint packhigh = uint(integer_from_trits[t4 * 81 + t3 * 27 + t2 * 9 + t1 * 3 + t0]);
+// Packs five trits (0..2) into the 8 bit ASTC trit block. Same values as the
+// reference integer_from_trits table, derived from the spec's decode rules.
+uint pack_trits(uint t0, uint t1, uint t2, uint t3, uint t4)
+{
+    uint c;
+    if (t2 == 2u)
+        c = (t1 == 2u) ? (12u + t0) : ((t1 << 4u) | ((t0 == 2u) ? 12u : (t0 << 2u)) | 3u);
+    else
+        c = (t2 << 4u) | (t1 << 2u) | t0;
 
-    orbits8_ptr(outputs, outpos, m0, bitcount);
+    if (t3 == 2u && t4 == 2u)
+    {
+        if (t2 == 2u && t1 == 2u) c |= 16u;
+        return ((c >> 2u) << 5u) | 28u | (c & 3u);
+    }
+    if ((c >> 2u) == 7u) c &= ~4u;
+    return (t4 == 2u) ? (c | (3u << 5u) | (t3 << 7u))
+                      : (c | (t3 << 5u) | (t4 << 7u));
+}
+
+// One group of five weights: 5 low-bit fields interleaved with the 8 trit bits.
+void encode_trit_group(uint b0, uint b1, uint b2, uint b3, uint b4,
+                       inout uvec4 outputs, inout uint outpos)
+{
+    const uint mask = (1u << WT_BITS) - 1u;
+    uint packhigh = pack_trits(b0 >> WT_BITS, b1 >> WT_BITS, b2 >> WT_BITS, b3 >> WT_BITS, b4 >> WT_BITS);
+
+    orbits8_ptr(outputs, outpos, b0 & mask, WT_BITS);
     orbits8_ptr(outputs, outpos, packhigh & 3u, 2u);
-    orbits8_ptr(outputs, outpos, m1, bitcount);
+    orbits8_ptr(outputs, outpos, b1 & mask, WT_BITS);
     orbits8_ptr(outputs, outpos, (packhigh >> 2u) & 3u, 2u);
-    orbits8_ptr(outputs, outpos, m2, bitcount);
+    orbits8_ptr(outputs, outpos, b2 & mask, WT_BITS);
     orbits8_ptr(outputs, outpos, (packhigh >> 4u) & 1u, 1u);
-    orbits8_ptr(outputs, outpos, m3, bitcount);
+    orbits8_ptr(outputs, outpos, b3 & mask, WT_BITS);
     orbits8_ptr(outputs, outpos, (packhigh >> 5u) & 3u, 2u);
-    orbits8_ptr(outputs, outpos, m4, bitcount);
+    orbits8_ptr(outputs, outpos, b4 & mask, WT_BITS);
     orbits8_ptr(outputs, outpos, (packhigh >> 7u) & 1u, 1u);
 }
 
-void encode_quints(uint bitcount, uint b0, uint b1, uint b2,
-                   inout uvec4 outputs, inout uint outpos)
-{
-    int q0, q1, q2;
-    uint m0, m1, m2;
-    split_high_low(b0, bitcount, q0, m0);
-    split_high_low(b1, bitcount, q1, m1);
-    split_high_low(b2, bitcount, q2, m2);
-
-    uint packhigh = uint(integer_from_quints[q2 * 25 + q1 * 5 + q0]);
-
-    orbits8_ptr(outputs, outpos, m0, bitcount);
-    orbits8_ptr(outputs, outpos, packhigh & 7u, 3u);
-    orbits8_ptr(outputs, outpos, m1, bitcount);
-    orbits8_ptr(outputs, outpos, (packhigh >> 3u) & 3u, 2u);
-    orbits8_ptr(outputs, outpos, m2, bitcount);
-    orbits8_ptr(outputs, outpos, (packhigh >> 5u) & 3u, 2u);
-}
-
-void bise_endpoints(uint numbers[8], int range, inout uvec4 outputs)
+void bise_weights(uint numbers[16], inout uvec4 outputs)
 {
     uint bitpos = 0u;
-    uint bits = uint(bits_trits_quints_table[range * 3 + 0]);
-    int trits = bits_trits_quints_table[range * 3 + 1];
-    int quints = bits_trits_quints_table[range * 3 + 2];
-#if HAS_ALPHA
-    int count = 8;
-#else
-    int count = 6;
-#endif
-
-    if (trits == 1)
-    {
-        encode_trits(bits, numbers[0], numbers[1], numbers[2], numbers[3], numbers[4], outputs, bitpos);
-        encode_trits(bits, numbers[5], numbers[6], numbers[7], 0u, 0u, outputs, bitpos);
-    }
-    else if (quints == 1)
-    {
-        encode_quints(bits, numbers[0], numbers[1], numbers[2], outputs, bitpos);
-        encode_quints(bits, numbers[3], numbers[4], numbers[5], outputs, bitpos);
-        encode_quints(bits, numbers[6], numbers[7], 0u, outputs, bitpos);
-    }
-    else
-    {
-        for (int i = 0; i < count; ++i)
-            orbits8_ptr(outputs, bitpos, numbers[i], bits);
-    }
-}
-
-void bise_weights(uint numbers[16], int range, inout uvec4 outputs)
-{
-    uint bitpos = 0u;
-    uint bits = uint(bits_trits_quints_table[range * 3 + 0]);
-    int trits = bits_trits_quints_table[range * 3 + 1];
-    int quints = bits_trits_quints_table[range * 3 + 2];
-
-    if (trits == 1)
-    {
-        encode_trits(bits, numbers[0], numbers[1], numbers[2], numbers[3], numbers[4], outputs, bitpos);
-        encode_trits(bits, numbers[5], numbers[6], numbers[7], numbers[8], numbers[9], outputs, bitpos);
-        encode_trits(bits, numbers[10], numbers[11], numbers[12], numbers[13], numbers[14], outputs, bitpos);
-        encode_trits(bits, numbers[15], 0u, 0u, 0u, 0u, outputs, bitpos);
-    }
-    else if (quints == 1)
-    {
-        encode_quints(bits, numbers[0], numbers[1], numbers[2], outputs, bitpos);
-        encode_quints(bits, numbers[3], numbers[4], numbers[5], outputs, bitpos);
-        encode_quints(bits, numbers[6], numbers[7], numbers[8], outputs, bitpos);
-        encode_quints(bits, numbers[9], numbers[10], numbers[11], outputs, bitpos);
-        encode_quints(bits, numbers[12], numbers[13], numbers[14], outputs, bitpos);
-        encode_quints(bits, numbers[15], 0u, 0u, outputs, bitpos);
-    }
-    else
-    {
-        for (int i = 0; i < 16; ++i)
-            orbits8_ptr(outputs, bitpos, numbers[i], bits);
-    }
+    encode_trit_group(numbers[0], numbers[1], numbers[2], numbers[3], numbers[4], outputs, bitpos);
+    encode_trit_group(numbers[5], numbers[6], numbers[7], numbers[8], numbers[9], outputs, bitpos);
+    encode_trit_group(numbers[10], numbers[11], numbers[12], numbers[13], numbers[14], outputs, bitpos);
+    encode_trit_group(numbers[15], 0u, 0u, 0u, 0u, outputs, bitpos);
 }
 
 // ---------------------------------------------------------------------------
@@ -410,8 +365,9 @@ uvec4 encode_block(vec4 texels[BLOCK_SIZE])
     ep_q[6] = 0u;
     ep_q[7] = 0u;
 #endif
-    uvec4 ep_ise = uvec4(0u);
-    bise_endpoints(ep_q, QUANT_256, ep_ise);
+    // 8 bit endpoints: the bounded integer sequence is just the bytes.
+    uvec4 ep_ise = uvec4(ep_q[0] | (ep_q[1] << 8u) | (ep_q[2] << 16u) | (ep_q[3] << 24u),
+                         ep_q[4] | (ep_q[5] << 8u) | (ep_q[6] << 16u) | (ep_q[7] << 24u), 0u, 0u);
 
     // weights
     float projw[X_GRIDS * Y_GRIDS];
@@ -420,10 +376,10 @@ uvec4 encode_block(vec4 texels[BLOCK_SIZE])
     for (int i = 0; i < X_GRIDS * Y_GRIDS; ++i)
     {
         uint q = quantize_weight(weight_range - 1u, projw[i]);
-        wt_q[i] = uint(scramble_table[weight_quantmethod * WEIGHT_QUANTIZE_NUM + int(q)]);
+        wt_q[i] = scramble_weight(q);
     }
     uvec4 wt_ise = uvec4(0u);
-    bise_weights(wt_q, weight_quantmethod, wt_ise);
+    bise_weights(wt_q, wt_ise);
 
     return assemble_block(blockmode, color_endpoint_mode, ep_ise, wt_ise);
 }

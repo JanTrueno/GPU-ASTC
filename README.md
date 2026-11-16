@@ -31,6 +31,14 @@ SDL_VIDEODRIVER=offscreen ./build/gpuastc in.png out.astc -v
 
 On a device with KMSDRM, leave `SDL_VIDEODRIVER` unset or set it to `kmsdrm`.
 
+## Performance notes
+
+Dynamic indexing of large `const` arrays in a shader makes many GPUs keep a per-thread copy
+in slow memory. The original port spent about 99% of its time in the trit and weight-scramble
+tables. Replacing them with arithmetic gave bit-identical output and ~95x speed on an RTX 4060
+(20 ms -> 0.2 ms for 9 Mpx). `tests/bench.py` times the shader and compares against saved
+baseline blocks (`--save-baseline` to create them).
+
 ## Tests
 
 `tests/gl_desktop_test.py` runs the shader as `#version 430` through moderngl, decodes
@@ -44,7 +52,7 @@ venv/Scripts/python tests/gl_desktop_test.py some.png
 
 ## Layout
 
-- `shaders/astc_encode.comp` encoder, `shaders/astc_tables.glsl` lookup tables
+- `shaders/astc_encode.comp` encoder (no lookup tables)
 - `src/astc_gles.*` reusable `gpuastc::Encoder` (no windowing code)
 - `src/main.cpp` command-line tool
 
