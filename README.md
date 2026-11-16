@@ -4,7 +4,8 @@ ASTC LDR texture encoder that runs as an **OpenGL ES 3.1 compute shader**.
 Aimed at aarch64 Linux embedded devices with no window system: the GLES
 context comes from SDL2 (KMSDRM or offscreen video driver).
 
-Status: first port, **not yet built or tested**.
+Status: the shader is validated on desktop OpenGL 4.3 (see Tests). The GLES 3.1
+build, SDL2 host and `-upload` path have **not been built or run yet**.
 
 ## What it does
 
@@ -29,6 +30,17 @@ SDL_VIDEODRIVER=offscreen ./build/gpuastc in.png out.astc -v
 ```
 
 On a device with KMSDRM, leave `SDL_VIDEODRIVER` unset or set it to `kmsdrm`.
+
+## Tests
+
+`tests/gl_desktop_test.py` runs the shader as `#version 430` through moderngl, decodes
+it with astcenc (`astc-encoder-py`) and reports PSNR next to astcenc's own encode.
+It checks the algorithm and bit packing, not GLSL ES compile rules.
+
+```bash
+python -m venv venv && venv/Scripts/pip install moderngl astc-encoder-py pillow numpy
+venv/Scripts/python tests/gl_desktop_test.py some.png
+```
 
 ## Layout
 
