@@ -7,13 +7,17 @@
 // many small images into one tall texture so they are encoded in a single dispatch.
 // The GLES context comes from SDL2, so it works on KMSDRM/offscreen with no window system.
 #include "astc_gles.h"
+#include "astcpak.h"
 #include "png_decode.h"
 
 #include <SDL.h>
 
 #include <dirent.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -46,12 +50,15 @@ void usage()
     std::fprintf(stderr,
         "usage: gpuastc input.png output.astc [options]\n"
         "       gpuastc -batch input_dir output_dir [options]\n"
+        "       gpuastc -pack input_dir archive.astcpak [options]   (all textures in one file)\n"
+        "       gpuastc -unpack archive.astcpak output_dir          (back to .astc files)\n"
         "  -b auto|4|5|6     block size (default auto: 4x4 up to 256x256, thin or alpha textures;\n"
         "                    5x5 up to 2048x2048; 6x6 above)\n"
         "  -alpha auto|on|off  encode alpha (default auto: on if any alpha < 255)\n"
         "  -norm             normal map (B and A forced to 1)\n"
         "  -j N              decoder threads in batch mode (default: cores - 1)\n"
         "  -update           skip files whose .astc is already newer than the .png\n"
+        "                    (with -pack: reuse unchanged entries from the existing archive)\n"
         "  -upload           also upload the result into an ASTC texture on the GPU (self-test)\n"
         "  -v                verbose\n");
 }
@@ -65,6 +72,8 @@ struct Cli {
     int threads = 0;
     bool update = false; // skip up-to-date outputs
     bool batch = false;
+    bool pack = false;   // -pack: write one archive instead of one file per texture
+    bool unpack = false; // -unpack: archive -> .astc files
     std::string in, out;
 };
 
@@ -119,12 +128,17 @@ struct Job {
     gpuastc::Image img;
     int block = 4;
     bool alpha = false;
+    uint64_t src_size = 0, src_mtime = 0; // of the source PNG (for -pack -update)
 };
 
 struct WriteJob {
-    std::string path;
+    std::string path;     // output file, or the entry name in -pack mode
     int block = 4, w = 0, h = 0;
+    bool alpha = false;
+    uint64_t src_size = 0, src_mtime = 0;
     std::vector<uint8_t> data;
+    const uint8_t* ext = nullptr; // -pack -update: blocks to copy from the old archive instead of `data`
+    size_t ext_size = 0;
 };
 
 inline size_t byte_size(const Job& j) { return j.img.rgba.size(); }
@@ -176,6 +190,164 @@ private:
 
 typedef BoundedQueue<Job> JobQueue;
 typedef BoundedQueue<WriteJob> WriteQueue;
+
+// ---------------------------------------------------------------------------
+// .astcpak archives (format: include/astcpak.h)
+// ---------------------------------------------------------------------------
+
+uint64_t fnv1a(const uint8_t* p, size_t n, uint64_t h)
+{
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+void set32(uint8_t* p, uint32_t v) { for (int i = 0; i < 4; ++i) p[i] = (uint8_t)(v >> (8 * i)); }
+void set64(uint8_t* p, uint64_t v) { for (int i = 0; i < 8; ++i) p[i] = (uint8_t)(v >> (8 * i)); }
+
+// Read-only memory map of a whole file.
+struct MappedFile {
+    void* p = nullptr;
+    size_t n = 0;
+    ~MappedFile() { if (p) munmap(p, n); }
+    bool open(const char* path)
+    {
+        const int fd = ::open(path, O_RDONLY);
+        if (fd < 0) return false;
+        struct stat st;
+        if (fstat(fd, &st) != 0 || st.st_size <= 0) { ::close(fd); return false; }
+        void* m = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        ::close(fd);
+        if (m == MAP_FAILED) return false;
+        p = m;
+        n = (size_t)st.st_size;
+        return true;
+    }
+};
+
+// Writes the archive sequentially (data first, index last) to <path>.tmp and renames it when done.
+// Used only from the writer thread.
+struct PackWriter {
+    struct Ent {
+        std::string name;
+        uint32_t w = 0, h = 0, block = 4;
+        bool alpha = false;
+        uint64_t off = 0, size = 0, src_size = 0, src_mtime = 0;
+    };
+    std::string final_path, tmp_path;
+    FILE* f = nullptr;
+    uint64_t pos = 0;
+    std::vector<Ent> ents;
+    std::map<std::tuple<uint64_t, uint64_t, uint64_t>, uint64_t> seen; // (size, hash, hash) -> offset
+    int shared = 0; // entries that reuse an identical earlier blob
+    bool ok = true;
+
+    bool open(const std::string& path)
+    {
+        final_path = path;
+        tmp_path = path + ".tmp";
+        f = std::fopen(tmp_path.c_str(), "wb");
+        if (!f) return false;
+        std::setvbuf(f, nullptr, _IOFBF, 1 << 20);
+        uint8_t zero[ASTCPAK_HEADER_SIZE] = {0};
+        ok = std::fwrite(zero, 1, sizeof(zero), f) == sizeof(zero); // header is rewritten in finish()
+        pos = ASTCPAK_HEADER_SIZE;
+        return ok;
+    }
+
+    void pad16()
+    {
+        while (pos & 15) { std::fputc(0, f); ++pos; }
+    }
+
+    void add(const WriteJob& wj)
+    {
+        const uint8_t* d = wj.ext ? wj.ext : wj.data.data();
+        const size_t n = wj.ext ? wj.ext_size : wj.data.size();
+        Ent e;
+        e.name = wj.path;
+        e.w = (uint32_t)wj.w;
+        e.h = (uint32_t)wj.h;
+        e.block = (uint32_t)wj.block;
+        e.alpha = wj.alpha;
+        e.src_size = wj.src_size;
+        e.src_mtime = wj.src_mtime;
+        e.size = n;
+        const auto key = std::make_tuple((uint64_t)n, fnv1a(d, n, 1469598103934665603ull), fnv1a(d, n, 0x9E3779B97F4A7C15ull));
+        auto it = seen.find(key);
+        if (it != seen.end()) {
+            e.off = it->second; // identical texture already stored: share it
+            ++shared;
+        } else {
+            pad16();
+            e.off = pos;
+            if (std::fwrite(d, 1, n, f) != n) ok = false;
+            pos += n;
+            seen[key] = e.off;
+        }
+        ents.push_back(e);
+    }
+
+    bool finish(uint32_t opt_block, uint32_t opt_alpha, uint32_t opt_normal)
+    {
+        std::sort(ents.begin(), ents.end(), [](const Ent& a, const Ent& b) { return a.name < b.name; });
+        pad16();
+        const uint64_t index_off = pos;
+        std::vector<uint8_t> idx;
+        std::string names;
+        auto p32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) idx.push_back((uint8_t)(v >> (8 * i))); };
+        auto p64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) idx.push_back((uint8_t)(v >> (8 * i))); };
+        for (const Ent& e : ents) {
+            p32((uint32_t)names.size()); p32((uint32_t)e.name.size());
+            p32(e.w); p32(e.h);
+            idx.push_back((uint8_t)e.block); idx.push_back(e.alpha ? 1 : 0); idx.push_back(0); idx.push_back(0);
+            p64(e.off); p64(e.size); p64(e.src_size); p64(e.src_mtime);
+            names += e.name;
+        }
+        idx.insert(idx.end(), names.begin(), names.end());
+        if (std::fwrite(idx.data(), 1, idx.size(), f) != idx.size()) ok = false;
+        pos += idx.size();
+
+        uint8_t hdr[ASTCPAK_HEADER_SIZE] = {0};
+        std::memcpy(hdr, "ASTCPAK1", 8);
+        set32(hdr + 8, ASTCPAK_VERSION);
+        set32(hdr + 12, (uint32_t)ents.size());
+        set64(hdr + 16, index_off);
+        set64(hdr + 24, idx.size());
+        set32(hdr + 32, opt_block);
+        set32(hdr + 36, opt_alpha);
+        set32(hdr + 40, opt_normal);
+        if (std::fseek(f, 0, SEEK_SET) != 0 || std::fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) ok = false;
+        if (std::fclose(f) != 0) ok = false;
+        f = nullptr;
+        if (ok && std::rename(tmp_path.c_str(), final_path.c_str()) != 0) ok = false;
+        if (!ok) std::remove(tmp_path.c_str());
+        return ok;
+    }
+};
+
+// -unpack: archive -> one .astc file per entry
+int unpack_archive(const std::string& archive, const std::string& out_dir)
+{
+    MappedFile mf;
+    astcpak pak;
+    if (!mf.open(archive.c_str()) || !astcpak_open(&pak, mf.p, mf.n)) {
+        std::fprintf(stderr, "%s: not a readable .astcpak archive\n", archive.c_str());
+        return 1;
+    }
+    mkdir(out_dir.c_str(), 0755);
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < pak.count; ++i) {
+        astcpak_entry e;
+        if (!astcpak_get(&pak, i, &e)) { ++bad; continue; }
+        const std::string path = out_dir + "/" + std::string(e.name, e.name_len) + ".astc";
+        if (!write_astc(path, (int)e.block, (int)e.width, (int)e.height, (const uint8_t*)e.blocks, (size_t)e.data_size)) {
+            std::fprintf(stderr, "cannot write %s\n", path.c_str());
+            ++bad;
+        }
+    }
+    std::printf("%u textures extracted to %s%s\n", pak.count - bad, out_dir.c_str(), bad ? " (some failed)" : "");
+    return bad ? 1 : 0;
+}
 
 // ---------------------------------------------------------------------------
 // GL side
@@ -330,6 +502,9 @@ bool flush_pack(Gpu& g, Pack& p)
         wj.block = block;
         wj.w = j.img.w;
         wj.h = j.img.h;
+        wj.alpha = p.alpha;
+        wj.src_size = j.src_size;
+        wj.src_mtime = j.src_mtime;
         wj.data.assign(mapped + first, mapped + first + size);
         g.writer->push(std::move(wj)); // saved on the writer thread, overlapping the next dispatch
         ++g.files_ok;
@@ -378,9 +553,11 @@ int main(int argc, char** argv)
 
     Cli cli;
     int first_opt = 3;
-    if (!std::strcmp(argv[1], "-batch")) {
+    if (!std::strcmp(argv[1], "-batch") || !std::strcmp(argv[1], "-pack") || !std::strcmp(argv[1], "-unpack")) {
         if (argc < 4) { usage(); return 1; }
         cli.batch = true;
+        cli.pack = !std::strcmp(argv[1], "-pack");
+        cli.unpack = !std::strcmp(argv[1], "-unpack");
         cli.in = argv[2];
         cli.out = argv[3];
         first_opt = 4;
@@ -409,14 +586,38 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    if (cli.unpack)
+        return unpack_archive(cli.in, cli.out);
+
     // what to convert
     FileList files;
     if (cli.batch) {
         if (!list_directory(cli.in, cli.out, files)) { std::fprintf(stderr, "cannot read directory %s\n", cli.in.c_str()); return 1; }
-        mkdir(cli.out.c_str(), 0755); // ok if it already exists
+        if (cli.pack) {
+            // the "output" of each file is its entry name in the archive: the file name without ".png"
+            for (auto& f : files) {
+                const size_t slash = f.first.find_last_of('/');
+                const std::string base = f.first.substr(slash == std::string::npos ? 0 : slash + 1);
+                f.second = base.substr(0, base.size() - 4);
+            }
+        } else {
+            mkdir(cli.out.c_str(), 0755); // ok if it already exists
+        }
         if (files.empty()) { std::fprintf(stderr, "no .png files in %s\n", cli.in.c_str()); return 1; }
     } else {
         files.push_back(std::make_pair(cli.in, cli.out));
+    }
+
+    PackWriter pack_writer;
+    MappedFile old_file;
+    astcpak old_pak;
+    bool old_ok = false; // an existing archive made with the same options, whose entries may be reused
+    if (cli.pack) {
+        if (cli.update && old_file.open(cli.out.c_str()) && astcpak_open(&old_pak, old_file.p, old_file.n) &&
+            old_pak.opt_block == (uint32_t)cli.block && old_pak.opt_alpha == (uint32_t)cli.alpha_mode &&
+            old_pak.opt_normal == (cli.normal ? 1u : 0u))
+            old_ok = true;
+        if (!pack_writer.open(cli.out)) { std::fprintf(stderr, "cannot create %s.tmp\n", cli.out.c_str()); return 1; }
     }
 
     // GLES 3.1 context through SDL2 (hidden window; works with offscreen/KMSDRM drivers).
@@ -463,7 +664,9 @@ int main(int argc, char** argv)
         WriteJob wj;
         while (write_queue.pop(wj)) {
             const double t0 = now_ms();
-            if (!write_astc(wj.path, wj.block, wj.w, wj.h, wj.data.data(), wj.data.size())) {
+            if (cli.pack) {
+                pack_writer.add(wj);
+            } else if (!write_astc(wj.path, wj.block, wj.w, wj.h, wj.data.data(), wj.data.size())) {
                 std::fprintf(stderr, "cannot write %s%s", wj.path.c_str(), "\n");
                 ++write_failed;
             }
@@ -482,7 +685,28 @@ int main(int argc, char** argv)
             for (;;) {
                 const size_t i = next.fetch_add(1);
                 if (i >= files.size()) break;
-                if (cli.update) { // output already there and not older than the input: nothing to do
+                struct stat st_src;
+                const bool have_src = stat(files[i].first.c_str(), &st_src) == 0;
+                if (cli.pack && old_ok && have_src) { // unchanged since it was packed: copy the old blocks
+                    astcpak_entry oe;
+                    if (astcpak_find(&old_pak, files[i].second.c_str(), &oe) && oe.src_size == (uint64_t)st_src.st_size &&
+                        oe.src_mtime == (uint64_t)st_src.st_mtime) {
+                        WriteJob wj;
+                        wj.path = files[i].second;
+                        wj.w = (int)oe.width;
+                        wj.h = (int)oe.height;
+                        wj.block = (int)oe.block;
+                        wj.alpha = oe.alpha != 0;
+                        wj.src_size = oe.src_size;
+                        wj.src_mtime = oe.src_mtime;
+                        wj.ext = (const uint8_t*)oe.blocks;
+                        wj.ext_size = (size_t)oe.data_size;
+                        write_queue.push(std::move(wj));
+                        ++skipped;
+                        continue;
+                    }
+                }
+                if (cli.update && !cli.pack) { // output already there and not older than the input: nothing to do
                     struct stat st_in, st_out;
                     if (stat(files[i].first.c_str(), &st_in) == 0 && stat(files[i].second.c_str(), &st_out) == 0 &&
                         st_out.st_size > 16 && st_out.st_mtime >= st_in.st_mtime) {
@@ -502,6 +726,7 @@ int main(int argc, char** argv)
                 j.alpha = cli.alpha_mode == 1 || (cli.alpha_mode == 0 && j.img.alpha);
                 j.block = cli.block ? cli.block : gpuastc::Encoder::pick_block(j.img.w, j.img.h, j.alpha);
                 j.out_path = files[i].second;
+                if (have_src) { j.src_size = (uint64_t)st_src.st_size; j.src_mtime = (uint64_t)st_src.st_mtime; }
                 queue.push(std::move(j));
             }
             if (--running == 0)
@@ -539,6 +764,11 @@ int main(int argc, char** argv)
     for (std::thread& t : workers) t.join();
     write_queue.close();
     writer.join();
+    bool pack_ok = true;
+    if (cli.pack) {
+        pack_ok = pack_writer.finish((uint32_t)cli.block, (uint32_t)cli.alpha_mode, cli.normal ? 1u : 0u);
+        if (!pack_ok) std::fprintf(stderr, "cannot write archive %s\n", cli.out.c_str());
+    }
     gpu.files_ok -= write_failed.load();
     gpu.files_failed += write_failed.load();
     const double wall = now_ms() - wall0;
@@ -552,6 +782,9 @@ int main(int argc, char** argv)
                     wall > 0 ? gpu.files_ok * 1000.0 / wall : 0.0, wall > 0 ? gpu.pixels / 1e3 / wall : 0.0);
         std::printf("  decode %.0f ms across %d thread(s), GPU upload+encode+readback %.0f ms in %d dispatch(es), file writes %.0f ms (own thread), output %.1f MB\n",
                     dec_total, nthreads, gpu.ms_gpu, gpu.dispatches, write_ms, gpu.bytes_out / 1e6);
+        if (cli.pack && pack_ok)
+            std::printf("  archive %s: %zu entries (%d sharing identical data), %.1f MB\n", cli.out.c_str(),
+                        pack_writer.ents.size(), pack_writer.shared, pack_writer.pos / 1e6);
     } else if (gpu.files_ok == 1) {
         std::printf("%s: written in %.2f ms (GPU %.2f ms)\n", files[0].second.c_str(), wall, gpu.ms_gpu);
     }
@@ -562,5 +795,5 @@ int main(int argc, char** argv)
     SDL_GL_DeleteContext(ctx);
     SDL_DestroyWindow(win);
     SDL_Quit();
-    return gpu.files_failed ? 1 : 0;
+    return (gpu.files_failed || !pack_ok) ? 1 : 0;
 }

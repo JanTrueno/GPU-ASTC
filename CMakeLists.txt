@@ -37,7 +37,7 @@ else()
 endif()
 
 add_executable(gpuastc src/main.cpp src/astc_gles.cpp)
-target_include_directories(gpuastc PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(gpuastc PRIVATE src include ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(gpuastc PRIVATE gpuastc_png Threads::Threads ${GLESV2_LIBRARY})
 if(TARGET SDL2::SDL2)
   target_link_libraries(gpuastc PRIVATE SDL2::SDL2)
@@ -49,3 +49,8 @@ endif()
 # compares the fast PNG decoder with stb_image: build/png_compare *.png
 add_executable(png_compare tests/png_compare.cpp)
 target_link_libraries(png_compare PRIVATE gpuastc_png)
+
+# checks a .astcpak archive against the per-file output: build/astcpak_test pack.astcpak files_dir
+add_executable(astcpak_test tests/astcpak_test.cpp)
+target_include_directories(astcpak_test PRIVATE include)
+target_link_libraries(astcpak_test PRIVATE gpuastc_png)

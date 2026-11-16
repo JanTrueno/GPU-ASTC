@@ -55,6 +55,36 @@ which is about 1.4-1.5x faster than stb_image here (inflate is only ~20% of the 
 filters and pixel conversion the rest); unusual PNGs (interlaced) fall back to stb_image.
 `build/png_compare *.png` checks the two decoders against each other.
 
+## Archives (for games you can modify)
+
+```bash
+gpuastc -pack sprites/ sprites.astcpak -v     # every .png in sprites/ -> one file
+gpuastc -pack sprites/ sprites.astcpak -update  # rerun: unchanged entries are copied from the old archive
+gpuastc -unpack sprites.astcpak out/          # back to one .astc file per texture
+```
+
+One sequential write instead of thousands of small files (much kinder to SD cards), and the game opens
+a single file. Entries are named after the PNG (without `.png`), sorted for lookup, and identical textures
+share one copy of their data (23 of 159 in one test set; the archive was 12% smaller than the separate files).
+`-pack -update` stores each source PNG's size and modification time and the options used, so it only
+re-encodes what changed, and rebuilds everything when `-b`/`-alpha`/`-norm` change. The archive is written to
+`<name>.tmp` and renamed when complete, so an interrupted run never leaves a half-written file.
+
+Reading it from a game is one header, `include/astcpak.h` (C99/C++, no dependencies). Map or read the whole
+file once, then each texture is a pointer into it:
+
+```c
+astcpak pak;
+astcpak_open(&pak, file_data, file_size);          // returns 0 if the file is not a usable archive
+astcpak_entry e;
+if (astcpak_find(&pak, "player_idle_0", &e))       // binary search by name
+    glCompressedTexImage2D(GL_TEXTURE_2D, 0, astcpak_gl_format(&e),
+                           e.width, e.height, 0, (GLsizei)e.data_size, e.blocks);
+```
+
+The file layout is described at the top of that header. `build/astcpak_test pack.astcpak files_dir` checks an
+archive against the per-file output of the same inputs.
+
 ## Build
 
 ```bash
