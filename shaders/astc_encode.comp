@@ -24,6 +24,13 @@ precision highp sampler2D;
 
 #define DIM BLOCK_DIM
 
+// dual-plane encoding is only used for 4x4 blocks with alpha
+#if HAS_ALPHA && BLOCK_DIM == 4
+#define DUAL_PLANE 1
+#else
+#define DUAL_PLANE 0
+#endif
+
 #define BLOCK_SIZE ((DIM) * (DIM))
 #define X_GRIDS 4
 #define Y_GRIDS 4
@@ -349,7 +356,120 @@ uint assemble_blockmode(uint weight_quantmethod)
     return blockmode;
 }
 
-uvec4 encode_block()
+// ---------------------------------------------------------------------------
+// dual-plane encoding for blocks with alpha (4x4 only)
+//
+// RGB and alpha each get their own binary weights (QUANT_2, 16 + 16 bits): RGB blends between two
+// colours, alpha between two alpha values. A block of "transparent + two opaque colours" (typical
+// pixel art) is then exact, which one colour line per block cannot do. Used only when its error is
+// lower than the single-plane encoding's.
+// ---------------------------------------------------------------------------
+
+#if DUAL_PLANE
+#define DUAL_ERR_THRESHOLD 16.0 // skip the dual-plane search when the single plane is already this good
+
+// Error metric used to choose between the encodings: RGB error counts in proportion to the source
+// alpha (the colour under a transparent pixel is invisible), alpha error counts fully.
+float pixel_error(vec4 t, vec4 decoded)
+{
+    vec4 d = t - decoded;
+    return (t.a * (1.0 / 255.0)) * dot(d.rgb, d.rgb) + d.a * d.a;
+}
+
+uvec4 encode_dual_plane(out float err)
+{
+    int n = min(uN, 16); // 16, but not a compile-time constant: keeps the loops rolled
+
+    // pass 1: alpha range and alpha-weighted mean colour
+    float amin = 255.0;
+    float amax = 0.0;
+    vec3 msum = vec3(0.0);
+    float wsum = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        vec4 t = texel(i);
+        amin = min(amin, t.a);
+        amax = max(amax, t.a);
+        float wt = t.a + 1.0;
+        msum += wt * t.rgb;
+        wsum += wt;
+    }
+    if (amax - amin < 1.0)
+    {
+        err = 1e30; // constant alpha: nothing for a second plane to do
+        return uvec4(0u);
+    }
+    vec3 mean = msum / wsum;
+
+    // pass 2: weighted covariance of the colours -> main axis
+    float c00 = 0.0, c01 = 0.0, c02 = 0.0, c11 = 0.0, c12 = 0.0, c22 = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        vec4 t = texel(i);
+        vec3 d = t.rgb - mean;
+        float wt = t.a + 1.0;
+        c00 += wt * d.x * d.x; c01 += wt * d.x * d.y; c02 += wt * d.x * d.z;
+        c11 += wt * d.y * d.y; c12 += wt * d.y * d.z; c22 += wt * d.z * d.z;
+    }
+    // divide by the weight sum: the iteration squares the matrix twice and overflows otherwise
+    vec3 axis = eigen_vector(mat4(c00, c01, c02, 0.0,
+                                  c01, c11, c12, 0.0,
+                                  c02, c12, c22, 0.0,
+                                  0.0, 0.0, 0.0, 0.0) / wsum).xyz;
+
+    // pass 3: split the colours in two at the mean and take the weighted mean of each side
+    vec3 s0 = vec3(0.0), s1 = vec3(0.0);
+    float w0 = 0.0, w1 = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        vec4 t = texel(i);
+        float wt = t.a + 1.0;
+        if (dot(t.rgb - mean, axis) > 0.0) { s1 += wt * t.rgb; w1 += wt; }
+        else                               { s0 += wt * t.rgb; w0 += wt; }
+    }
+    vec3 e0 = (w0 > 0.0) ? s0 / w0 : ((w1 > 0.0) ? s1 / w1 : mean);
+    vec3 e1 = (w1 > 0.0) ? s1 / w1 : e0;
+
+    // 8 bit endpoints; the RGB decoder swaps endpoints (blue contraction) unless sum(e1) >= sum(e0)
+    vec3 r0 = round(e0);
+    vec3 r1 = round(e1);
+    if (r0.x + r0.y + r0.z > r1.x + r1.y + r1.z)
+    {
+        vec3 tmp = r0; r0 = r1; r1 = tmp;
+    }
+    float a0 = round(amin);
+    float a1 = round(amax);
+    float amid = 0.5 * (a0 + a1);
+
+    // pass 4: each pixel takes the nearer colour endpoint and the nearer alpha endpoint
+    uint bits = 0u;
+    err = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        vec4 t = texel(i);
+        vec3 d0 = t.rgb - r0;
+        vec3 d1 = t.rgb - r1;
+        bool hi = dot(d1, d1) < dot(d0, d0);
+        bool ahi = t.a > amid;
+        err += pixel_error(t, vec4(hi ? r1 : r0, ahi ? a1 : a0));
+        bits |= (hi ? 1u : 0u) << uint(2 * i);
+        bits |= (ahi ? 1u : 0u) << uint(2 * i + 1);
+    }
+
+    // Block mode: 4x4 weight grid, 1 bit weights, dual plane (same layout as assemble_blockmode,
+    // R = 2, H = 0, D = 1). Endpoints are RGBA direct, weights are the interleaved bit stream.
+    const uint blockmode = 0x441u;
+    uvec3 q0 = uvec3(r0);
+    uvec3 q1 = uvec3(r1);
+    uvec4 ep_ise = uvec4(q0.r | (q1.r << 8u) | (q0.g << 16u) | (q1.g << 24u),
+                         q0.b | (q1.b << 8u) | (uint(a0) << 16u) | (uint(a1) << 24u), 0u, 0u);
+    uvec4 blk = assemble_block(blockmode, CEM_LDR_RGBA_DIRECT, ep_ise, uvec4(bits, 0u, 0u, 0u));
+    blk.z |= 3u << 30u; // colour component selector = 3 (alpha has its own weights), just below the weights
+    return blk;
+}
+#endif
+
+uvec4 encode_block(out float single_error)
 {
     vec4 ep0, ep1;
     principal_component_analysis(ep0, ep1);
@@ -429,9 +549,22 @@ uvec4 encode_block()
 
     // pass 2: quantize each weight to 4 bits (values < 12) and keep them in two uints
     uvec2 wq = uvec2(0u);
+#if DUAL_PLANE
+    float single_err = 0.0; // estimated error of this encoding, to compare with the dual-plane one
+    vec4 e0r = vec4(a);
+    vec4 e1r = vec4(b);
+#endif
     for (int i = 0; i < nw; ++i)
     {
+#if DUAL_PLANE
+        vec4 t = texel(i);
+        float w = (dot(vec_k, t) - k0 - minw) * invlen; // same value weight_q() computes
+        uint qn = quantize_weight(WEIGHT_RANGE - 1u, w);
+        single_err += pixel_error(t, e0r + (float(qn) / float(WEIGHT_RANGE - 1u)) * (e1r - e0r));
+        uint q = scramble_weight(qn) << (uint(i & 7) * 4u);
+#else
         uint q = weight_q(i, vec_k, k0, minw, invlen) << (uint(i & 7) * 4u);
+#endif
         if (i < 8) wq.x |= q; else wq.y |= q;
     }
 #endif
@@ -445,6 +578,11 @@ uvec4 encode_block()
     encode_trit_group(WQ(10), WQ(11), WQ(12), WQ(13), WQ(14), wt_ise, bitpos);
     encode_trit_group(WQ(15), 0u, 0u, 0u, 0u, wt_ise, bitpos);
 
+#if DUAL_PLANE
+    single_error = single_err;
+#else
+    single_error = 0.0;
+#endif
     return assemble_block(blockmode, color_endpoint_mode, ep_ise, wt_ise);
 }
 
@@ -454,5 +592,18 @@ void main()
     if (b.x >= uBlocks.x || b.y >= uBlocks.y)
         return;
     g_origin = b * DIM;
-    blocks[b.y * uBlocks.x + b.x] = encode_block();
+    int index = b.y * uBlocks.x + b.x;
+    float single_err;
+    blocks[index] = encode_block(single_err);
+#if DUAL_PLANE
+    // Written first so the single-plane state is dead before the dual-plane search starts
+    // (this lowers register use: 63 -> 57 on Mali-G31; the other variants stay at 32).
+    if (single_err > DUAL_ERR_THRESHOLD)
+    {
+        float dual_err;
+        uvec4 dual_block = encode_dual_plane(dual_err);
+        if (dual_err < single_err)
+            blocks[index] = dual_block;
+    }
+#endif
 }

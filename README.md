@@ -20,11 +20,12 @@ and matches the desktop-GL encoder in 99.9% of blocks. Not yet run on a real Mal
 
 ## Limits of the current encoder
 
-Hard-edged images with more than two colours per block (pixel-art sprites, icons with alpha) encode
-badly: on 16x16 sprites the PSNR is 15-22 dB where astcenc reaches 60-99 dB, because one colour line
-per block cannot represent three or more distinct colours. Smooth images are fine (typically within
-1-2 dB of astcenc fast at 4x4). Partitions are the missing feature; a practical stopgap is to measure
-the error per block and re-encode the bad ones with astcenc on the CPU.
+4x4 blocks with alpha use a **dual-plane** mode when it beats the single-plane encoding: RGB and alpha get
+separate binary weights, so "transparent + two opaque colours" blocks (typical pixel art) are exact. On 106
+small sprites with alpha this raised the mean PSNR (measured on the blended result, alpha-weighted) from 38.0
+to 43.2 dB (astcenc medium: 55.5); no image got worse. Remaining weakness: blocks with three or more *opaque*
+colours (they need partitions), and smooth gradients in alpha textures. The alpha 4x4 variant needs 57
+registers on Mali-G31 (50% occupancy); every other variant stays at 32.
 
 
 Ported from niepp/astc_encoder: single partition, single weight plane, a fixed
