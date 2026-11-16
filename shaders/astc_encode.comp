@@ -144,9 +144,10 @@ void encode_trit_group(uint b0, uint b1, uint b2, uint b3, uint b4,
 // endpoints: principal component analysis
 // ---------------------------------------------------------------------------
 
-// Power iteration for the dominant axis. The original used 8 iterations; quality is
-// unchanged down to 3 (measured), which cuts about 40% of the arithmetic.
-#define EIGEN_ITERATIONS 3
+// Power iteration for the dominant axis. The original used 8 iterations. Starting from the
+// highest-variance covariance column, quality is unchanged down to 1 (measured on photos and
+// sprites; 0 loses ~0.1 dB on photos), which removes about 20% of the arithmetic.
+#define EIGEN_ITERATIONS 1
 vec4 eigen_vector(mat4 m)
 {
     // Start from the covariance column with the largest variance. A fixed start vector can be
