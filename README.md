@@ -10,7 +10,9 @@ build, SDL2 host and `-upload` path have **not been built or run yet**.
 ## What it does
 
 - Loads PNG (grey, grey+alpha, RGB, RGBA, palette, 16-bit) and converts to RGBA8.
-- Encodes ASTC 4x4, 5x5 or 6x6 (`-b 4|5|6`), one block per GPU invocation.
+- Encodes ASTC 4x4, 5x5 or 6x6 (`-b auto|4|5|6`), one block per GPU invocation.
+- `-b auto` (default) picks the block size from the texture: 4x4 up to 256x256, for thin textures
+  (shortest side <= 64, e.g. 1000x16) and for anything with alpha; 5x5 up to 2048x2048; 6x6 above.
 - Transparency: RGBA endpoints, enabled automatically when any alpha < 255.
 - Writes `.astc` files, and can upload straight into a `GL_COMPRESSED_RGBA_ASTC_*`
   texture through a pixel unpack buffer (`-upload`).

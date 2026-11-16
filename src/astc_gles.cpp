@@ -12,6 +12,17 @@ GLenum Encoder::internal_format(int block)
     }
 }
 
+int Encoder::pick_block(int width, int height, bool alpha)
+{
+    const long long area = (long long)width * height;
+    const int shortest = width < height ? width : height;
+    if (alpha || shortest <= 64 || area <= 256LL * 256)
+        return 4;
+    if (area <= 2048LL * 2048)
+        return 5;
+    return 6;
+}
+
 Encoder::~Encoder() { destroy(); }
 
 void Encoder::destroy()

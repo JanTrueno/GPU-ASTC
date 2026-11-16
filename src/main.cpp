@@ -18,7 +18,8 @@ static void usage()
 {
     std::fprintf(stderr,
         "usage: gpuastc input.png output.astc [options]\n"
-        "  -b 4|5|6          block size (default 4)\n"
+        "  -b auto|4|5|6     block size (default auto: 4x4 up to 256x256, thin or alpha textures;\n"
+        "                    5x5 up to 2048x2048; 6x6 above)\n"
         "  -alpha auto|on|off  encode alpha (default auto: on if any alpha < 255)\n"
         "  -norm             normal map (B and A forced to 1)\n"
         "  -upload           also upload the result into an ASTC texture on the GPU (self-test)\n"
@@ -55,10 +56,14 @@ int main(int argc, char** argv)
     if (argc < 3) { usage(); return 1; }
 
     gpuastc::Options opt;
+    opt.block = 0; // 0 = auto, resolved once the image size and alpha are known
     int alpha_mode = 0; // 0 auto, 1 on, 2 off
     bool verbose = false, upload = false;
     for (int i = 3; i < argc; ++i) {
-        if (!std::strcmp(argv[i], "-b") && i + 1 < argc) opt.block = std::atoi(argv[++i]);
+        if (!std::strcmp(argv[i], "-b") && i + 1 < argc) {
+            const char* v = argv[++i];
+            opt.block = !std::strcmp(v, "auto") ? 0 : std::atoi(v);
+        }
         else if (!std::strcmp(argv[i], "-alpha") && i + 1 < argc) {
             const char* v = argv[++i];
             alpha_mode = !std::strcmp(v, "on") ? 1 : !std::strcmp(v, "off") ? 2 : 0;
@@ -68,7 +73,10 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "-v")) verbose = true;
         else { usage(); return 1; }
     }
-    if (opt.block != 4 && opt.block != 6) { std::fprintf(stderr, "block must be 4 or 6\n"); return 1; }
+    if (opt.block != 0 && opt.block != 4 && opt.block != 5 && opt.block != 6) {
+        std::fprintf(stderr, "block must be auto, 4, 5 or 6\n");
+        return 1;
+    }
 
     // Load as RGBA8: grey, grey+alpha, RGB, palette and 16-bit PNGs are all converted.
     int w = 0, h = 0, comp = 0;
@@ -79,8 +87,11 @@ int main(int argc, char** argv)
     for (size_t i = 3; i < (size_t)w * h * 4; i += 4)
         if (pixels[i] != 255) { any_alpha = true; break; }
     opt.alpha = alpha_mode == 1 || (alpha_mode == 0 && any_alpha);
+    if (opt.block == 0)
+        opt.block = gpuastc::Encoder::pick_block(w, h, opt.alpha);
     if (verbose)
-        std::printf("%dx%d, %d source channels, alpha %s\n", w, h, comp, opt.alpha ? "on" : "off");
+        std::printf("%dx%d, %d source channels, alpha %s, block %dx%d\n", w, h, comp,
+                    opt.alpha ? "on" : "off", opt.block, opt.block);
 
     // GLES 3.1 context through SDL2 (hidden window; works with offscreen/KMSDRM drivers).
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1; }

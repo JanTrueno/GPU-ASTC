@@ -30,6 +30,12 @@ public:
     static int blocks(int texels, int block) { return (texels + block - 1) / block; }
     static GLenum internal_format(int block); // GL_COMPRESSED_RGBA_ASTC_*_KHR
 
+    // Chooses a block size (4, 5 or 6) from the texture size:
+    //  - 4x4 for textures up to 256x256, thin textures (shortest side <= 64, e.g. 1000x16)
+    //    and anything with alpha (block edges hurt alpha the most)
+    //  - 5x5 up to 2048x2048, 6x6 above that
+    static int pick_block(int width, int height, bool alpha);
+
 private:
     GLuint program_ = 0;
     GLint loc_tex_size_ = -1;
