@@ -107,7 +107,8 @@ bool decode_xnb_memory(const std::vector<uint8_t>& file, Image& out, std::string
 
 int xnb_astc_surface_format(int block)
 {
-    // FNA's patch appends Astc4x4EXT..Astc8x8EXT after the existing SurfaceFormat values.
+    // RHH-Ports' fna3d-astc-r8.patch appends ASTC4X4/5X5/6X6/8X8 (RGBA, non-sRGB) right after
+    // Bc7SrgbEXT, which is 24 in FNA 24.x, giving 25..28. Not yet checked against a converted file.
     switch (block) {
         case 4: return 25;
         case 5: return 26;

@@ -16,7 +16,7 @@ gpuastc -batch Content/ Content/             # XNA/FNA .xnb textures -> ASTC .xn
 ```
 
 `.png` and `.xnb` (LZX-compressed or not, Color format) are read; subfolders are included. XNB output keeps the file name
-and holds ASTC (surface format values 25-28 are **unverified** against a real patched FNA). Non-texture .xnb files are copied
+and holds ASTC (surface format values 25-28 follow from the RHH-Ports FNA3D ASTC patch (appended after Bc7SrgbEXT = 24), but are not yet checked against a converted file). Non-texture .xnb files are copied
 unchanged when writing to another folder. XNA colour is premultiplied by alpha; the encoder handles that automatically for .xnb
 (`-premult` forces it for PNG). Files whose output is already newer than the input are skipped; `-force` converts everything.
 New input formats: one decode function plus a line in `src/formats.cpp`.
