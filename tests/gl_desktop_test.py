@@ -25,6 +25,7 @@ def gpu_encode(ctx, rgba, block, alpha):
     buf.bind_to_storage_buffer(0)
     prog["uTexSize"].value = (w, h)
     prog["uBlocks"].value = (bx, by)
+    prog["uN"].value = block * block
     prog.run((bx + 7) // 8, (by + 7) // 8, 1)
     ctx.finish()
     return buf.read()

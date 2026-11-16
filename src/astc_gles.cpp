@@ -67,6 +67,7 @@ bool Encoder::create(const Options& opt, std::string* log)
 
     loc_tex_size_ = glGetUniformLocation(program_, "uTexSize");
     loc_blocks_ = glGetUniformLocation(program_, "uBlocks");
+    loc_count_ = glGetUniformLocation(program_, "uN");
     return true;
 }
 
@@ -88,6 +89,7 @@ bool Encoder::encode(GLuint tex, int width, int height, GLuint out_buffer)
     glUseProgram(program_);
     glUniform2i(loc_tex_size_, width, height);
     glUniform2i(loc_blocks_, bx, by);
+    glUniform1i(loc_count_, opt_.block * opt_.block); // texels per block; keeps shader loops rolled
     glDispatchCompute((bx + 7) / 8, (by + 7) / 8, 1);
 
     glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT);

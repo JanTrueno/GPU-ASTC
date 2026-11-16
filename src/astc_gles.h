@@ -34,6 +34,7 @@ private:
     GLuint program_ = 0;
     GLint loc_tex_size_ = -1;
     GLint loc_blocks_ = -1;
+    GLint loc_count_ = -1;
     Options opt_;
 };
 
