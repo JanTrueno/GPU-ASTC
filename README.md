@@ -3,8 +3,8 @@
 ASTC texture encoder that runs as an **OpenGL ES 3.1 compute shader**, for embedded Linux devices
 without a window system (the GLES context comes from SDL2: KMSDRM or offscreen).
 
-Status: builds and runs on Linux (tested on Ubuntu/WSL with Mesa llvmpipe). Output decodes correctly
-with astcenc. Not yet run on a real Mali device.
+It's what compresses Terraria's textures on the handheld itself in our PortMaster port.
+It also runs on desktop Linux (Mesa, llvmpipe), and its output decodes correctly with astcenc.
 
 ## Usage
 
@@ -22,7 +22,8 @@ unchanged when writing to another folder. XNA colour is premultiplied by alpha; 
 New input formats: one decode function plus a line in `src/formats.cpp`.
 
 Options: `-b auto|4|5|6` block size (auto: 4x4 up to 256x256, thin textures and anything with alpha;
-5x5 up to 2048x2048; 6x6 above), `-alpha auto|on|off`, `-norm` normal map, `-upload` self-test of the GPU upload.
+5x5 up to 2048x2048; 6x6 above), `-alpha auto|on|off`, `-norm` normal map, `-upload` self-test of the GPU upload,
+`-mem MB` memory for images waiting between reading, encoding and saving (default 384; lower it on 1 GB devices).
 
 - **Batch:** one GL context, decoding on worker threads, small images packed into one dispatch,
   files saved on a separate writer thread.

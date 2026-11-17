@@ -61,6 +61,8 @@ void usage()
         "  -alpha auto|on|off  encode alpha (default auto: on if any alpha < 255)\n"
         "  -norm             normal map (B and A forced to 1)\n"
         "  -j N              decoder threads in batch mode (default: cores - 1)\n"
+        "  -mem MB           memory for images waiting between reading, encoding and saving (default 384;\n"
+        "                    lower it on small devices, the GPU rarely waits for more than a few images)\n"
         "  -prefetch N       read up to N files ahead into the page cache on helper threads (slow storage)\n"
         "  -force            convert everything again. By default a file whose output is already newer than\n"
         "                    the input is skipped (with -pack: unchanged entries are reused from the old\n"
@@ -77,6 +79,7 @@ struct Cli {
     bool upload = false;
     bool verbose = false;
     int threads = 0;
+    int mem_mb = 384;    // split: 2/3 decoded images, 1/6 small images collected for one dispatch, 1/6 finished output
     bool update = true;  // skip up-to-date outputs (-force turns this off)
     bool premult = false; // force premultiplied-alpha handling
     int prefetch = 0;    // read-ahead distance in files (0 = off)
@@ -589,7 +592,6 @@ bool flush_pack(Gpu& g, Pack& p)
 
 const long long kSmallPixels = 1 << 18;      // images up to this size are packed together
 const long long kPackPixels = 1 << 20;       // flush a pack once it holds this many pixels
-const long long kMaxPendingPixels = 1 << 24; // flush everything above this many waiting pixels
 
 } // namespace
 
@@ -621,6 +623,7 @@ int main(int argc, char** argv)
             cli.alpha_mode = !std::strcmp(v, "on") ? 1 : !std::strcmp(v, "off") ? 2 : 0;
         }
         else if (!std::strcmp(argv[i], "-j") && i + 1 < argc) cli.threads = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "-mem") && i + 1 < argc) cli.mem_mb = std::max(16, std::atoi(argv[++i]));
         else if (!std::strcmp(argv[i], "-update")) cli.update = true; // now the default
         else if (!std::strcmp(argv[i], "-force")) cli.update = false;
         else if (!std::strcmp(argv[i], "-premult")) cli.premult = true;
@@ -695,8 +698,10 @@ int main(int argc, char** argv)
     if (!cli.batch) nthreads = 1;
     nthreads = std::min<int>(nthreads, (int)files.size());
 
-    JobQueue queue(256u << 20); // at most ~256 MB of decoded pixels waiting
-    WriteQueue write_queue(64u << 20); // and ~64 MB of finished blocks waiting to be saved
+    const size_t mem = (size_t)cli.mem_mb << 20;
+    JobQueue queue(mem / 3 * 2);        // decoded pixels waiting for the GPU
+    WriteQueue write_queue(mem / 6);    // finished blocks waiting to be saved
+    const long long max_pending_pixels = (long long)(mem / 6 / 4); // small RGBA images collected for packing
     gpu.writer = &write_queue;
     std::atomic<int> write_failed(0);
     double write_ms = 0; // only touched by the writer thread until it is joined
@@ -861,7 +866,7 @@ int main(int argc, char** argv)
         pending += (long long)w * h;
         p.add(std::move(job));
         if (p.pixels >= kPackPixels) { pending -= p.pixels; flush_pack(gpu, p); }
-        if (pending > kMaxPendingPixels) {
+        if (pending > max_pending_pixels) {
             for (auto& kv : packs) flush_pack(gpu, kv.second);
             pending = 0;
         }
