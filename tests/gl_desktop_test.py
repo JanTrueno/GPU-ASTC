@@ -9,10 +9,20 @@ import astc_encoder as ae
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-def shader_source(block, alpha, normal=False):
+def shader_source(block, alpha, normal=False, premult=False, extra=""):
     body = (ROOT / "shaders/astc_encode.comp").read_text()
-    head = f"#version 430\n#define BLOCK_DIM {block}\n#define HAS_ALPHA {int(alpha)}\n#define IS_NORMALMAP {int(normal)}\n"
+    head = (f"#version 430\n#define BLOCK_DIM {block}\n#define HAS_ALPHA {int(alpha)}\n#define IS_NORMALMAP {int(normal)}\n"
+            f"#define PREMULTIPLIED {int(premult)}\n{extra}")
     return head + body
+
+_lut = {}
+def bind_lut(ctx):
+    """Partition table for the 4x4 shader, on texture unit 1."""
+    if ctx not in _lut:
+        import partition_lut
+        _lut[ctx] = ctx.texture((256, 256), 1, partition_lut.lut().tobytes(), dtype="u4")
+        _lut[ctx].filter = (moderngl.NEAREST, moderngl.NEAREST)
+    _lut[ctx].use(1)
 
 def gpu_encode(ctx, rgba, block, alpha):
     h, w, _ = rgba.shape
@@ -21,11 +31,12 @@ def gpu_encode(ctx, rgba, block, alpha):
     tex = ctx.texture((w, h), 4, np.ascontiguousarray(rgba).tobytes())
     tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
     tex.use(0)
+    bind_lut(ctx)
     buf = ctx.buffer(reserve=bx * by * 16)
     buf.bind_to_storage_buffer(0)
     prog["uTexSize"].value = (w, h)
     prog["uBlocks"].value = (bx, by)
-    prog["uN"].value = block * block
+    if "uN" in prog: prog["uN"].value = block * block
     prog.run((bx + 7) // 8, (by + 7) // 8, 1)
     ctx.finish()
     return buf.read()
