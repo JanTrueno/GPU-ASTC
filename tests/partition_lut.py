@@ -1,5 +1,5 @@
 """ASTC 2-partition patterns for 4x4 blocks and the nearest-pattern table the shader uses.
-lut()[mask] = seed | pattern << 16, where bit i of mask/pattern is the group of texel i (x + 4*y)."""
+lut()[mask] = seed | distance << 10 | pattern << 16, where bit i of mask/pattern is the group of texel i (x + 4*y)."""
 import numpy as np
 
 M = 0xFFFFFFFF
@@ -44,7 +44,7 @@ def lut():
         for b in range(16):
             nb = idx ^ (1 << b); better = dist[nb] + 1 < dist
             if better.any(): dist[better] = dist[nb][better] + 1; val[better] = val[nb][better]; changed = True
-    return val
+    return val | (dist.astype(np.uint32) << 10)
 
 if __name__ == "__main__":
     v = lut(); print("unique patterns:", len(set(int(x) >> 16 for x in v)))

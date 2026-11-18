@@ -75,7 +75,8 @@ uniform int uN;           // BLOCK_SIZE (non-constant so loops are not unrolled)
 layout(binding = 0) uniform highp sampler2D uTex;
 #if TWO_PARTITIONS
 // 256x256, R32UI: for every 16 bit "which side is each texel on" mask, the closest 2-partition
-// pattern the format offers: seed in bits 0-9, the pattern's own mask in bits 16-31.
+// pattern the format offers: seed in bits 0-9, number of texels that differ in bits 10-14,
+// the pattern's own mask in bits 16-31.
 layout(binding = 1) uniform highp usampler2D uPartLut;
 #endif
 layout(std430, binding = 0) writeonly buffer OutBuffer { uvec4 blocks[]; };
@@ -319,12 +320,13 @@ void put_weights(inout uvec4 blk, uvec4 ws)
 // ---------------------------------------------------------------------------
 // one partition, one plane: three passes over the block
 //   1. mean, covariance, flat test          -> main axis
-//   2. extent of the texels along the axis  -> endpoints (and the two-sided split, for partitions)
+//   2. extent of the texels along the axis  -> endpoints
 //   3. weights against the stored endpoints -> bits, error, least-squares sums
+//      (and, for partitions, three ways to split the texels in two: at 1/4, 1/2, 3/4 of the line)
 // then the endpoints are refitted to the weights that were chosen.
 // ---------------------------------------------------------------------------
 
-uvec4 encode_block(out float err, out uint split, out bool opaque)
+uvec4 encode_block(out float err, out uint split, out bool opaque, out vec4 tlo, out vec4 thi, out vec4 tfar)
 {
     // pass 1. Moments are taken relative to the first texel: sums of products of raw 0..255
     // values would lose the low bits that the covariance of a smooth block lives in.
@@ -352,6 +354,7 @@ uvec4 encode_block(out float err, out uint split, out bool opaque)
 
     err = 0.0;
     split = 0u;
+    tlo = ref; thi = ref; tfar = ref;
 #if HAS_ALPHA
     opaque = ref.a + cmin.a > 254.5;
 #else
@@ -393,12 +396,14 @@ uvec4 encode_block(out float err, out uint split, out bool opaque)
     float hi = -1e31;
     for (int i = 0; i < uN; ++i)
     {
-        float p = dot(texel(i) - mean, axis);
+        vec4 t = texel(i);
+        float p = dot(t - mean, axis);
+#if TWO_PARTITIONS
+        if (p < lo) tlo = t;
+        if (p > hi) thi = t;
+#endif
         lo = min(lo, p);
         hi = max(hi, p);
-#if TWO_PARTITIONS
-        split |= ((p > 0.0) ? 1u : 0u) << uint(i);
-#endif
     }
 
     // Storage: alpha blocks that are in fact opaque are stored as RGB, which frees bits.
@@ -430,6 +435,7 @@ uvec4 encode_block(out float err, out uint split, out bool opaque)
     float sw = 0.0;
     float sww = 0.0;
     vec4 swt = vec4(0.0);
+    float worst = -1.0;
     for (int g = 0; g < ngroups; ++g)
     {
         uint grp = 0u;
@@ -451,7 +457,15 @@ uvec4 encode_block(out float err, out uint split, out bool opaque)
             sww += wu * wu;
             swt += wu * t;
 #if TWO_PARTITIONS || DUAL_PLANE
-            err += pixel_error(t, e0 + wu * d);
+            float pe = pixel_error(t, e0 + wu * d);
+            err += pe;
+#endif
+#if TWO_PARTITIONS
+            split |= ((w > 0.5) ? 1u : 0u) << uint(i);
+            // third cluster seed: the texel farthest from both ends of the line
+            vec4 f0 = t - tlo, f1 = t - thi;
+            float far = min(dot(f0, f0), dot(f1, f1));
+            if (far > worst) { worst = far; tfar = t; }
 #endif
             grp |= q << uint(4 * j);
         }
@@ -486,6 +500,9 @@ uvec4 encode_block(out float err, out uint split, out bool opaque)
 // ---------------------------------------------------------------------------
 
 #if TWO_PARTITIONS
+#ifndef PART_CANDIDATES
+#define PART_CANDIDATES 4
+#endif
 // Endpoints of one group: opposite corners of its bounding box. Which corner each channel starts
 // from follows the sign of its covariance with the widest channel. Exact for two colours.
 void partition_box(uint pm, uint p, out vec4 lo, out vec4 hi)
@@ -523,9 +540,13 @@ void partition_box(uint pm, uint p, out vec4 lo, out vec4 hi)
     hi = mix(mn, mx, up);
 }
 
-uvec4 encode_two_partitions(uint split, bool opaque, out float err)
+uint nearest_pattern(uint mask)
 {
-    uint lut = texelFetch(uPartLut, ivec2(int(split & 255u), int(split >> 8u)), 0).r;
+    return texelFetch(uPartLut, ivec2(int(mask & 255u), int((mask >> 8u) & 255u)), 0).r;
+}
+
+uvec4 encode_two_partitions(uint lut, bool opaque, out float err)
+{
     uint seed = lut & 1023u;
     uint pm = lut >> 16u; // bit i: group of texel i
 
@@ -719,9 +740,10 @@ void main()
     float err;
     uint split;
     bool opaque;
+    vec4 tlo, thi, tfar;
     // Written first so the single-plane state is dead before the other searches start
     // (this lowers register use).
-    blocks[index] = encode_block(err, split, opaque);
+    blocks[index] = encode_block(err, split, opaque, tlo, thi, tfar);
 
 #if DUAL_PLANE
     if (!opaque && err > ALT_ERR_THRESHOLD)
@@ -738,10 +760,37 @@ void main()
 #if TWO_PARTITIONS
     if (err > ALT_ERR_THRESHOLD)
     {
-        float e2;
-        uvec4 blk = encode_two_partitions(split, opaque, e2);
-        if (e2 < err)
-            blocks[index] = blk;
+        // Sort the texels by which of three colours they are nearest to: the two at the ends of
+        // the colour line and the one farthest from both. Candidate splits: each of those
+        // groups against the rest, and the two halves of the line.
+        uvec3 grp = uvec3(0u);
+        int n = min(uN, 16);
+        for (int i = 0; i < n; ++i)
+        {
+            vec4 t = texel(i);
+            vec4 d0 = t - tlo, d1 = t - thi, d2 = t - tfar;
+            float l0 = dot(d0, d0), l1 = dot(d1, d1), l2 = dot(d2, d2);
+            if (l2 < l0 && l2 < l1) grp.z |= 1u << uint(i);
+            else if (l1 < l0)       grp.y |= 1u << uint(i);
+            else                    grp.x |= 1u << uint(i);
+        }
+        uint seen0 = 0xFFFFu, seen1 = 0xFFFFu, seen2 = 0xFFFFu;
+        for (int k = 0; k < PART_CANDIDATES; ++k)
+        {
+            uint mask = (k == 0) ? split : ((k == 1) ? grp.z : ((k == 2) ? grp.x : grp.y));
+            uint lut = nearest_pattern(mask);
+            uint seed = lut & 1023u;
+            if (seed == seen0 || seed == seen1 || seed == seen2)
+                continue;
+            seen2 = seen1; seen1 = seen0; seen0 = seed;
+            float e2;
+            uvec4 blk = encode_two_partitions(lut, opaque, e2);
+            if (e2 < err)
+            {
+                blocks[index] = blk;
+                err = e2;
+            }
+        }
     }
 #endif
 }
