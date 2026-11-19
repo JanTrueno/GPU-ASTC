@@ -106,6 +106,7 @@ precision highp usampler2D;
 #define MODE_4x4_Q6  0x043u
 #define MODE_4x4_Q3  0x051u
 #define MODE_4x4_Q4  0x042u
+#define MODE_4x4_Q5  0x052u
 #define MODE_4x4_Q2_DUAL 0x441u
 #define MODE_5x5_Q5  0x0F2u
 #define MODE_5x5_Q3  0x0F1u
@@ -323,7 +324,9 @@ float pixel_error(vec4 t, vec4 decoded)
 // on photos and sprites; 0 loses ~0.1 dB on photos), which removes about 20% of the arithmetic.
 // A fixed start vector can be orthogonal to the real axis (for example a block that only varies in
 // alpha, where a start vector with alpha = 0 is sent to zero).
+#ifndef EIGEN_ITERATIONS
 #define EIGEN_ITERATIONS 1
+#endif
 vec3 cov_mul(vec3 xr, vec3 xg, vec3 v)
 {
     return vec3(dot(xr, v), dot(vec3(xr.y, xg.xy), v), dot(vec3(xr.z, xg.yz), v));
@@ -1117,7 +1120,8 @@ bool encode_two_partitions_big(uint seed, uvec2 pm, inout float best, out uvec4 
 // The texels are split in two groups, each with its own colour line, so a block with a hard edge
 // between two areas no longer has to put both on one line. The format only offers a fixed set of
 // split patterns; the table gives the closest one to a wanted split.
-// Storage: opaque RGB 6 bit endpoints + 3 weight levels; with alpha RGBA 4 bit + 4 levels.
+// Storage: opaque RGB 5 bit endpoints + 5 weight levels (edges are rarely hard enough for the
+// 3 levels that 6 bit endpoints would leave); with alpha RGBA 4 bit + 4 levels.
 // ---------------------------------------------------------------------------
 
 #if TWO_PARTITIONS
@@ -1141,8 +1145,8 @@ uint nearest_pattern(uint mask)
 bool encode_two_partitions(uint lut, bool opaque, inout float best, out uvec4 blk)
 {
     uint pm = lut >> 16u; // bit i: group of texel i
-    int ebits = opaque ? 6 : 4;
-    float wmax = opaque ? 2.0 : 3.0;
+    int ebits = opaque ? 5 : 4;
+    float wmax = opaque ? 4.0 : 3.0;
 
     TV mn0 = TV(255.0), mx0 = TV(0.0), mn1 = TV(255.0), mx1 = TV(0.0);
     TV sa = TV(0.0), s1 = TV(0.0);
@@ -1187,6 +1191,7 @@ bool encode_two_partitions(uint lut, bool opaque, inout float best, out uvec4 bl
     vec2 inv = wmax / max(vec2(dot(d0, d0), dot(d1, d1)), vec2(SMALL_VALUE));
 
     uint wq = 0u; // 2 bits per texel
+    uvec2 w4 = uvec2(0u); // 4 bits per texel, 8 texels per word
     S2 swa = S2(0.0), sw1 = S2(0.0);
     S2 swwa = S2(0.0), sww1 = S2(0.0);
     TV swta = TV(0.0), swt1 = TV(0.0);
@@ -1202,8 +1207,9 @@ bool encode_two_partitions(uint lut, bool opaque, inout float best, out uvec4 bl
         bool g = ((pm >> uint(i)) & 1u) != 0u;
         float gf = float(g);
         float q = floor(clamp(dot(t - (g ? e1 : e0), g ? d1 : d0) * (g ? inv.y : inv.x), 0.0, wmax) + 0.5);
-        float wu = opaque ? q * 0.5 : floor(q * 21.34) * (1.0 / 64.0); // 0,32,64 or 0,21,43,64
-        wq |= uint(q) << uint(2 * i);
+        float wu = opaque ? q * 0.25 : floor(q * 21.34) * (1.0 / 64.0); // 0,16,..64 or 0,21,43,64
+        if (i < 8) w4.x |= uint(q) << uint(4 * i); else w4.y |= uint(q) << uint(4 * i - 32);
+        wq |= uint(q) << uint(2 * i); // only right with alpha (q < 4), and only used there
 #if WEIGHTED
         vec2 om = vec2(t.a * (1.0 / 255.0), 1.0);
         vec4 ot = om.xxxy * t;
@@ -1246,7 +1252,7 @@ bool encode_two_partitions(uint lut, bool opaque, inout float best, out uvec4 bl
 
     // block mode, partition count - 1, seed, 2 bits "same endpoint type for both", endpoint type
     blk = uvec4(0u);
-    uint mode = opaque ? MODE_4x4_Q3 : MODE_4x4_Q4;
+    uint mode = opaque ? MODE_4x4_Q5 : MODE_4x4_Q4;
     uint cem = opaque ? CEM_LDR_RGB_DIRECT : CEM_LDR_RGBA_DIRECT; // in a variable: see encode_block
     blk.x = mode | (1u << 11u) | ((lut & 1023u) << 13u) | (cem << 25u);
     uint pos = 29u;
@@ -1256,18 +1262,18 @@ bool encode_two_partitions(uint lut, bool opaque, inout float best, out uvec4 bl
     uvec2 ws = uvec2(wq, 0u); // with alpha: two bits per weight, stored as they are
     if (opaque)
     {
-        ws.x = 0u;
-        for (int g = 0; g < 4; ++g)
+        // five levels: three weights in seven bits, the sixteenth alone in three
+        ws = uvec2(0u);
+        for (int g = 0; g < 6; ++g)
         {
-            uint grp = 0u;
-            for (int j = 0; j < 5; ++j)
+            uvec3 q = uvec3(0u);
+            for (int j = 0; j < 3; ++j)
             {
-                int i = g * 5 + j;
-                if (i >= 16)
-                    break;
-                grp |= ((wq >> uint(2 * i)) & 3u) << uint(4 * j);
+                int i = g * 3 + j;
+                if (i < 16)
+                    q[j] = (((i < 8) ? w4.x : w4.y) >> uint(4 * (i & 7))) & 15u;
             }
-            ws.x |= trit_group_bits(grp, 0u) << uint(8 * g);
+            put2(ws, uint(7 * g), pack_quints(q.x, q.y, q.z) & ((g == 5) ? 7u : 127u));
         }
     }
     put_weights(blk, ws);
