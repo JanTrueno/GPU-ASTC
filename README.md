@@ -23,10 +23,14 @@ New input formats: one decode function plus a line in `src/formats.cpp`.
 
 Options: `-q fast|normal|best` 4x4 search effort (see Encoder), `-b auto|4|5|6` block size (auto: 4x4 up to 256x256, thin textures and anything with alpha;
 5x5 up to 2048x2048; 6x6 above), `-alpha auto|on|off`, `-norm` normal map, `-upload` self-test of the GPU upload,
-`-mem MB` memory for images waiting between reading, encoding and saving (default 384; lower it on 1 GB devices).
+`-mem MB` memory for source files, images and results waiting between reading, encoding and saving (default: 40% of
+the free memory, 64 to 768), `-cache DIR` / `-nocache` where compiled shaders are kept between runs (default
+`$XDG_CACHE_HOME/gpuastc` or `~/.cache/gpuastc`), `-nosync` do not wait for the results to reach the storage.
 
-- **Batch:** one GL context, decoding on worker threads, small images packed into one dispatch,
-  files saved on a separate writer thread.
+- **Batch:** one GL context, reader threads that fetch the source files ahead of the decoders, decoding on
+  worker threads, small images packed into one dispatch, results held in memory until the reading is done and
+  then saved in path order by a writer thread. Compiled shaders are cached: on Mali-G31 compiling the three
+  common variants takes about 2 s per run, loading them 0.03 s.
 - **Archive:** `include/astcpak.h` is a header-only C/C++ reader for games you can modify
   (`astcpak_open`, `astcpak_find`, `astcpak_gl_format`). Layout is documented at the top of the header.
 - **Encoder:** one weight per texel at every block size (4x4: 12 levels, 5x5: 5, 6x6: 3; fewer for blocks

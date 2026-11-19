@@ -5,6 +5,11 @@
 //
 // Batch mode keeps one GL context and shader, decodes PNGs on worker threads, and packs
 // many small images into one tall texture so they are encoded in a single dispatch.
+//
+// Storage (usually an SD card) is used in two phases: reader threads fetch the source files into
+// memory as far ahead as the memory budget allows; results are held in memory until the reading
+// is done and then written in path order, so the card is not asked to read and write at the
+// same time.
 // The GLES context comes from SDL2, so it works on KMSDRM/offscreen with no window system.
 #include "astc_gles.h"
 #include "astcpak.h"
@@ -33,6 +38,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -63,9 +69,11 @@ void usage()
         "                    normal: blocks that fits badly also try two partitions. best: more of that.\n"
         "  -norm             normal map (B and A forced to 1)\n"
         "  -j N              decoder threads in batch mode (default: cores - 1)\n"
-        "  -mem MB           memory for images waiting between reading, encoding and saving (default 384;\n"
-        "                    lower it on small devices, the GPU rarely waits for more than a few images)\n"
-        "  -prefetch N       read up to N files ahead into the page cache on helper threads (slow storage)\n"
+        "  -mem MB           memory for source files, decoded images and results waiting between reading,\n"
+        "                    encoding and saving (default: 40%% of the free memory, 64 to 768)\n"
+        "  -nosync           do not wait for the results to reach the storage before exiting\n"
+        "  -cache DIR        keep compiled shaders in DIR between runs (default: $XDG_CACHE_HOME/gpuastc or\n"
+        "                    ~/.cache/gpuastc); -nocache compiles every time\n"
         "  -force            convert everything again. By default a file whose output is already newer than\n"
         "                    the input is skipped (with -pack: unchanged entries are reused from the old\n"
         "                    archive). Use -force after changing -b, -alpha, -norm or -premult.\n"
@@ -82,10 +90,13 @@ struct Cli {
     bool upload = false;
     bool verbose = false;
     int threads = 0;
-    int mem_mb = 384;    // split: 2/3 decoded images, 1/6 small images collected for one dispatch, 1/6 finished output
+    int mem_mb = 0;      // 0 = from free memory. Split: 1/6 source files, 1/2 decoded images, 1/6 small images
+                         // collected for one dispatch, 1/6 finished output
+    bool sync = true;    // batch: wait until the results are on the storage
+    std::string cache;   // directory for compiled shaders
+    bool use_cache = true;
     bool update = true;  // skip up-to-date outputs (-force turns this off)
     bool premult = false; // force premultiplied-alpha handling
-    int prefetch = 0;    // read-ahead distance in files (0 = off)
     bool batch = false;
     bool pack = false;   // -pack: write one archive instead of one file per texture
     bool unpack = false; // -unpack: archive -> .astc files
@@ -120,10 +131,61 @@ bool write_file_atomic(const std::string& path, const uint8_t* data, size_t size
     return true;
 }
 
-void make_parents(const std::string& path)
+
+// Reads a whole file with one path lookup (open, then fstat on the descriptor): on FUSE file
+// systems every lookup by name is a round trip to the driver process.
+bool read_file_once(const char* path, std::vector<uint8_t>& out, uint64_t& size, uint64_t& mtime)
 {
-    for (size_t i = 1; i < path.size(); ++i)
-        if (path[i] == '/') mkdir(path.substr(0, i).c_str(), 0755); // fails harmlessly if it exists
+    const int fd = ::open(path, O_RDONLY);
+    if (fd < 0) return false;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) { ::close(fd); return false; }
+    size = (uint64_t)st.st_size;
+    mtime = (uint64_t)st.st_mtime;
+    out.resize((size_t)st.st_size);
+    size_t done = 0;
+    while (done < out.size()) {
+        const ssize_t n = ::read(fd, out.data() + done, out.size() - done);
+        if (n <= 0) break;
+        done += (size_t)n;
+    }
+    ::close(fd);
+    return done == out.size();
+}
+
+// Creates the directories above path. `made` remembers the ones already done, so each directory
+// costs its mkdir calls once and not once per file.
+void make_parents(const std::string& path, std::set<std::string>& made)
+{
+    const size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos || slash == 0) return;
+    const std::string dir = path.substr(0, slash);
+    if (!made.insert(dir).second) return;
+    for (size_t i = 1; i < dir.size(); ++i)
+        if (dir[i] == '/') mkdir(dir.substr(0, i).c_str(), 0755); // fails harmlessly if it exists
+    mkdir(dir.c_str(), 0755);
+}
+
+// Free memory in MB (MemAvailable), or 0 if it cannot be read.
+int available_memory_mb()
+{
+    FILE* f = std::fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[128];
+    long kb = 0;
+    while (std::fgets(line, sizeof(line), f))
+        if (std::sscanf(line, "MemAvailable: %ld kB", &kb) == 1) break;
+    std::fclose(f);
+    return (int)(kb / 1024);
+}
+
+// Asks the file system that holds dir to write out what it has buffered, and waits for it.
+void sync_storage(const std::string& dir)
+{
+    const int fd = ::open(dir.c_str(), O_RDONLY);
+    if (fd < 0) return;
+    if (syncfs(fd) != 0) fsync(fd);
+    ::close(fd);
 }
 
 typedef std::vector<std::pair<std::string, std::string>> FileList; // (input path, output path / entry name)
@@ -179,8 +241,17 @@ struct Job {
     uint64_t src_size = 0, src_mtime = 0; // of the source PNG (for -pack -update)
 };
 
+// A source file read into memory, waiting for a decoder thread.
+struct RawJob {
+    size_t index = 0; // into the file list
+    std::vector<uint8_t> bytes;
+    bool read_ok = false;
+    uint64_t src_size = 0, src_mtime = 0;
+};
+
 struct WriteJob {
     std::string path;     // output file, or the entry name in -pack mode
+    bool raw = false;     // data is a whole file to be written as it is (content that is not a texture)
     int block = 4, w = 0, h = 0;
     bool alpha = false;
     uint64_t src_size = 0, src_mtime = 0;
@@ -190,6 +261,7 @@ struct WriteJob {
     size_t ext_size = 0;
 };
 
+inline size_t byte_size(const RawJob& j) { return j.bytes.size(); }
 inline size_t byte_size(const Job& j) { return j.img.rgba.size(); }
 inline size_t byte_size(const WriteJob& j) { return j.data.size(); }
 
@@ -422,6 +494,9 @@ struct Gpu {
     int max_tex = 2048;
     bool normal = false, upload = false, verbose = false;
     int quality = 1;
+    std::string cache_dir;
+    double ms_shader = 0; // compiling or loading the shader variants
+    int shaders_cached = 0, shaders_built = 0;
 
     // statistics
     double ms_gpu = 0;
@@ -440,8 +515,13 @@ struct Gpu {
         o.premultiplied = premult;
         o.normal_map = normal;
         o.quality = quality;
+        o.cache_dir = cache_dir;
         std::string log;
-        if (!e->create(o, &log)) {
+        const double t0 = now_ms();
+        const bool created = e->create(o, &log);
+        ms_shader += now_ms() - t0;
+        if (created) ++(e->from_cache() ? shaders_cached : shaders_built);
+        if (!created) {
             std::fprintf(stderr, "shader error (%dx%d, alpha %d):\n%s\n", block, block, alpha ? 1 : 0, log.c_str());
             return nullptr;
         }
@@ -636,7 +716,10 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "-update")) cli.update = true; // now the default
         else if (!std::strcmp(argv[i], "-force")) cli.update = false;
         else if (!std::strcmp(argv[i], "-premult")) cli.premult = true;
-        else if (!std::strcmp(argv[i], "-prefetch") && i + 1 < argc) cli.prefetch = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "-prefetch") && i + 1 < argc) ++i; // older option: the reader thread replaces it
+        else if (!std::strcmp(argv[i], "-nosync")) cli.sync = false;
+        else if (!std::strcmp(argv[i], "-cache") && i + 1 < argc) cli.cache = argv[++i];
+        else if (!std::strcmp(argv[i], "-nocache")) cli.use_cache = false;
         else if (!std::strcmp(argv[i], "-norm")) cli.normal = true;
         else if (!std::strcmp(argv[i], "-upload")) cli.upload = true;
         else if (!std::strcmp(argv[i], "-v")) cli.verbose = true;
@@ -689,6 +772,19 @@ int main(int argc, char** argv)
     gpu.upload = cli.upload;
     gpu.verbose = cli.verbose;
     gpu.quality = cli.quality;
+    if (cli.use_cache) {
+        if (cli.cache.empty()) {
+            const char* xdg = std::getenv("XDG_CACHE_HOME");
+            const char* home = std::getenv("HOME");
+            if (xdg && *xdg) cli.cache = std::string(xdg) + "/gpuastc";
+            else if (home && *home) cli.cache = std::string(home) + "/.cache/gpuastc";
+        }
+        if (!cli.cache.empty()) {
+            std::set<std::string> made;
+            make_parents(cli.cache + "/x", made);
+            gpu.cache_dir = cli.cache;
+        }
+    }
     GLint max_tex = 2048;
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
     gpu.max_tex = (int)max_tex;
@@ -708,23 +804,49 @@ int main(int argc, char** argv)
     if (!cli.batch) nthreads = 1;
     nthreads = std::min<int>(nthreads, (int)files.size());
 
+    if (cli.mem_mb <= 0) {
+        const int avail = available_memory_mb();
+        cli.mem_mb = avail > 0 ? std::max(64, std::min(768, avail * 2 / 5)) : 384;
+    }
     const size_t mem = (size_t)cli.mem_mb << 20;
-    JobQueue queue(mem / 3 * 2);        // decoded pixels waiting for the GPU
-    WriteQueue write_queue(mem / 6);    // finished blocks waiting to be saved
+    BoundedQueue<RawJob> raw_queue(mem / 6); // source files waiting for a decoder
+    JobQueue queue(mem / 2);                 // decoded pixels waiting for the GPU
+    WriteQueue write_queue(mem / 12);        // finished blocks on their way to the writer
+    const size_t hold_bytes = mem / 6;       // results the writer keeps back while sources are still being read
     const long long max_pending_pixels = (long long)(mem / 6 / 4); // small RGBA images collected for packing
     gpu.writer = &write_queue;
+    const std::string sync_dir = cli.pack ? (cli.out.find('/') == std::string::npos ? std::string(".") : cli.out.substr(0, cli.out.find_last_of('/')))
+                                          : cli.out;
+
     std::atomic<int> write_failed(0);
-    double write_ms = 0; // only touched by the writer thread until it is joined
+    std::atomic<int> decode_failed(0);
+    std::atomic<int> skipped(0);
+    std::atomic<int> not_textures(0), unsupported(0), copied(0);
+    std::atomic<bool> reading_done(false);
+    double write_ms = 0, sync_ms = 0; // only touched by the writer thread until it is joined
+    const int nreaders = (int)std::min<size_t>(4, files.size());
+    std::vector<double> read_ms(nreaders, 0.0);
+    std::atomic<size_t> next(0);
+    std::atomic<int> readers_running(nreaders);
+    const double wall0 = now_ms();
+
+    // Writer: keeps results in memory while the reader still has source files to fetch (up to its
+    // share of the budget), then writes what it holds in path order and the rest as it arrives.
     std::thread writer([&]() {
-        WriteJob wj;
-        while (write_queue.pop(wj)) {
+        std::set<std::string> made_dirs;
+        std::vector<WriteJob> held;
+        size_t held_size = 0;
+        auto save = [&](WriteJob& wj) {
             const double t0 = now_ms();
             if (cli.pack) {
                 pack_writer.add(wj);
             } else {
-                make_parents(wj.path);
+                make_parents(wj.path, made_dirs);
                 bool ok;
-                if (!wj.meta.empty()) {
+                if (wj.raw) {
+                    ok = write_file_atomic(wj.path, wj.data.data(), wj.data.size());
+                    if (ok) ++copied;
+                } else if (!wj.meta.empty()) {
                     const std::vector<uint8_t> x = gpuastc::build_astc_xnb(wj.meta, wj.block, wj.w, wj.h, wj.data.data(), wj.data.size());
                     ok = write_file_atomic(wj.path, x.data(), x.size());
                 } else {
@@ -742,68 +864,104 @@ int main(int argc, char** argv)
                 }
             }
             write_ms += now_ms() - t0;
+        };
+        auto save_held = [&]() {
+            std::sort(held.begin(), held.end(), [](const WriteJob& a, const WriteJob& b) { return a.path < b.path; });
+            for (WriteJob& h : held) save(h);
+            held.clear();
+            held_size = 0;
+        };
+        WriteJob wj;
+        while (write_queue.pop(wj)) {
+            // an archive is one file written front to back already: nothing to gain from holding
+            if (!cli.pack && !reading_done.load() && held_size + byte_size(wj) <= hold_bytes) {
+                held_size += byte_size(wj);
+                held.push_back(std::move(wj));
+                continue;
+            }
+            save_held();
+            save(wj);
+        }
+        save_held();
+    });
+
+    // Readers: the only threads that touch the source files. They hand the bytes to the decoders
+    // and run ahead of them as far as the memory budget allows. Several of them, because on the
+    // FUSE file systems some firmwares use for the card, opening a file costs a round trip that
+    // one thread alone turns into the bottleneck (measured: 1500 files, 8.8 s with one reader,
+    // about 2.6 s with three).
+    std::vector<std::thread> readers;
+    for (int t = 0; t < nreaders; ++t) readers.emplace_back([&, t]() {
+        for (;;) {
+            const size_t i = next.fetch_add(1);
+            if (i >= files.size()) break;
+            // The separate stat is only needed where a file may be skipped without reading it.
+            const bool may_skip = (cli.pack && old_ok) || (cli.update && cli.batch && !cli.pack && files[i].first != files[i].second);
+            struct stat st_src;
+            const bool have_src = may_skip && stat(files[i].first.c_str(), &st_src) == 0;
+            if (cli.pack && old_ok && have_src) { // unchanged since it was packed: copy the old blocks
+                astcpak_entry oe;
+                if (astcpak_find(&old_pak, files[i].second.c_str(), &oe) && oe.src_size == (uint64_t)st_src.st_size &&
+                    oe.src_mtime == (uint64_t)st_src.st_mtime) {
+                    WriteJob wj;
+                    wj.path = files[i].second;
+                    wj.w = (int)oe.width;
+                    wj.h = (int)oe.height;
+                    wj.block = (int)oe.block;
+                    wj.alpha = oe.alpha != 0;
+                    wj.src_size = oe.src_size;
+                    wj.src_mtime = oe.src_mtime;
+                    wj.ext = (const uint8_t*)oe.blocks;
+                    wj.ext_size = (size_t)oe.data_size;
+                    write_queue.push(std::move(wj));
+                    ++skipped;
+                    continue;
+                }
+            }
+            if (cli.update && cli.batch && !cli.pack && have_src && files[i].first != files[i].second) { // output already there and not older than the input: nothing to do
+                struct stat st_out;
+                if (stat(files[i].second.c_str(), &st_out) == 0 && st_out.st_size > 16 && st_out.st_mtime >= st_src.st_mtime) {
+                    ++skipped;
+                    continue;
+                }
+            }
+            RawJob r;
+            r.index = i;
+            const double t0 = now_ms();
+            r.read_ok = read_file_once(files[i].first.c_str(), r.bytes, r.src_size, r.src_mtime);
+            read_ms[t] += now_ms() - t0;
+            raw_queue.push(std::move(r));
+        }
+        if (--readers_running == 0) {
+            reading_done = true;
+            raw_queue.close();
         }
     });
-    std::atomic<size_t> next(0);
-    std::atomic<int> decode_failed(0);
-    std::atomic<int> skipped(0);
-    std::atomic<int> not_textures(0), unsupported(0), copied(0);
+
     std::atomic<int> running(nthreads);
     std::vector<double> decode_ms(nthreads, 0.0);
-    std::vector<double> read_ms(nthreads, 0.0);
     std::vector<std::thread> workers;
-    const double wall0 = now_ms();
     for (int t = 0; t < nthreads; ++t) {
         workers.emplace_back([&, t]() {
-            for (;;) {
-                const size_t i = next.fetch_add(1);
-                if (i >= files.size()) break;
-                struct stat st_src;
-                const bool have_src = stat(files[i].first.c_str(), &st_src) == 0;
-                if (cli.pack && old_ok && have_src) { // unchanged since it was packed: copy the old blocks
-                    astcpak_entry oe;
-                    if (astcpak_find(&old_pak, files[i].second.c_str(), &oe) && oe.src_size == (uint64_t)st_src.st_size &&
-                        oe.src_mtime == (uint64_t)st_src.st_mtime) {
-                        WriteJob wj;
-                        wj.path = files[i].second;
-                        wj.w = (int)oe.width;
-                        wj.h = (int)oe.height;
-                        wj.block = (int)oe.block;
-                        wj.alpha = oe.alpha != 0;
-                        wj.src_size = oe.src_size;
-                        wj.src_mtime = oe.src_mtime;
-                        wj.ext = (const uint8_t*)oe.blocks;
-                        wj.ext_size = (size_t)oe.data_size;
-                        write_queue.push(std::move(wj));
-                        ++skipped;
-                        continue;
-                    }
-                }
-                if (cli.update && cli.batch && !cli.pack && files[i].first != files[i].second) { // output already there and not older than the input: nothing to do
-                    struct stat st_in, st_out;
-                    if (stat(files[i].first.c_str(), &st_in) == 0 && stat(files[i].second.c_str(), &st_out) == 0 &&
-                        st_out.st_size > 16 && st_out.st_mtime >= st_in.st_mtime) {
-                        ++skipped;
-                        continue;
-                    }
-                }
+            RawJob r;
+            while (raw_queue.pop(r)) {
+                const size_t i = r.index;
                 Job j;
                 std::string err;
-                std::vector<uint8_t> file_bytes;
-                const double t0 = now_ms();
-                const bool read_ok = gpuastc::read_file(files[i].first.c_str(), file_bytes);
                 const double t1 = now_ms();
-                if (!read_ok) err = "cannot read file";
+                if (!r.read_ok) err = "cannot read file";
                 const gpuastc::InputFormat* fmt = gpuastc::input_format_for(files[i].first);
-                if (!read_ok || !fmt || !fmt->decode(file_bytes, j.img, &err)) {
-                    if (read_ok && err == gpuastc::xnb_already_astc()) { ++skipped; continue; }
-                    if (read_ok && fmt && fmt->writes_same_container && cli.batch) {
+                if (!r.read_ok || !fmt || !fmt->decode(r.bytes, j.img, &err)) {
+                    if (r.read_ok && err == gpuastc::xnb_already_astc()) { ++skipped; continue; }
+                    if (r.read_ok && fmt && fmt->writes_same_container && cli.batch) {
                         // A content file we do not convert (font, sound, model, unsupported texture format):
                         // carry it over unchanged so the output folder is a complete Content folder.
                         if (!cli.pack && files[i].first != files[i].second) {
-                            make_parents(files[i].second);
-                            if (write_file_atomic(files[i].second, file_bytes.data(), file_bytes.size())) ++copied;
-                            else { std::fprintf(stderr, "cannot write %s\n", files[i].second.c_str()); ++decode_failed; }
+                            WriteJob wj;
+                            wj.path = files[i].second;
+                            wj.raw = true;
+                            wj.data = std::move(r.bytes);
+                            write_queue.push(std::move(wj));
                         }
                         const bool real_problem = err == "LZX data is corrupt" || err.compare(0, 20, "surface format is no") == 0;
                         if (real_problem) { std::fprintf(stderr, "%s: %s (copied unchanged)\n", files[i].first.c_str(), err.c_str()); ++unsupported; }
@@ -814,44 +972,19 @@ int main(int argc, char** argv)
                     ++decode_failed;
                     continue;
                 }
-                read_ms[t] += t1 - t0;
                 decode_ms[t] += now_ms() - t1;
                 j.alpha = cli.alpha_mode == 1 || (cli.alpha_mode == 0 && j.img.alpha);
                 j.premult = j.alpha && (cli.premult || j.img.premultiplied);
                 j.block = cli.block ? cli.block : gpuastc::Encoder::pick_block(j.img.w, j.img.h, j.alpha);
                 j.out_path = files[i].second;
-                if (have_src) { j.src_size = (uint64_t)st_src.st_size; j.src_mtime = (uint64_t)st_src.st_mtime; }
+                j.src_size = r.src_size;
+                j.src_mtime = r.src_mtime;
+                r.bytes = std::vector<uint8_t>(); // free the source bytes before waiting on the queue
                 queue.push(std::move(j));
             }
             if (--running == 0)
                 queue.close();
         });
-    }
-
-    // Optional read-ahead: helper threads ask the OS to load the next files into the page cache,
-    // so the decode threads find them in memory (hides per-file latency on slow storage).
-    std::atomic<size_t> pf_next(0);
-    std::atomic<bool> pf_stop(false);
-    std::vector<std::thread> prefetchers;
-    if (cli.prefetch > 0) {
-        for (int k = 0; k < 2; ++k) {
-            prefetchers.emplace_back([&]() {
-                for (;;) {
-                    const size_t i = pf_next.fetch_add(1);
-                    if (i >= files.size()) break;
-                    while (!pf_stop.load() && i >= next.load() + (size_t)cli.prefetch)
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    if (pf_stop.load()) break;
-                    const int fd = ::open(files[i].first.c_str(), O_RDONLY);
-                    if (fd >= 0) {
-                        struct stat st;
-                        if (fstat(fd, &st) == 0 && st.st_size > 0)
-                            readahead(fd, 0, (size_t)st.st_size);
-                        ::close(fd);
-                    }
-                }
-            });
-        }
     }
 
     // GL thread: collect small images into packs, encode big ones directly.
@@ -882,15 +1015,19 @@ int main(int argc, char** argv)
         }
     }
     for (auto& kv : packs) flush_pack(gpu, kv.second);
+    for (std::thread& t : readers) t.join();
     for (std::thread& t : workers) t.join();
-    pf_stop = true;
-    for (std::thread& t : prefetchers) t.join();
     write_queue.close();
     writer.join();
     bool pack_ok = true;
     if (cli.pack) {
         pack_ok = pack_writer.finish((uint32_t)cli.block, (uint32_t)cli.alpha_mode, cli.normal ? 1u : 0u);
         if (!pack_ok) std::fprintf(stderr, "cannot write archive %s\n", cli.out.c_str());
+    }
+    if (cli.batch && cli.sync) { // the run is not over until the results are on the storage
+        const double t0 = now_ms();
+        sync_storage(sync_dir);
+        sync_ms += now_ms() - t0;
     }
     gpu.files_ok -= write_failed.load();
     gpu.files_failed += write_failed.load();
@@ -907,8 +1044,9 @@ int main(int argc, char** argv)
         std::printf("%d files converted, %d up to date (skipped), %d failed, %.2f Mpx in %.0f ms (%.1f files/s, %.1f Mpx/s)\n",
                     gpu.files_ok, skipped.load(), gpu.files_failed, gpu.pixels / 1e6, wall,
                     wall > 0 ? gpu.files_ok * 1000.0 / wall : 0.0, wall > 0 ? gpu.pixels / 1e3 / wall : 0.0);
-        std::printf("  file read %.0f ms + decode %.0f ms across %d thread(s), GPU upload+encode+readback %.0f ms in %d dispatch(es), file writes %.0f ms (own thread), output %.1f MB\n",
-                    read_total, dec_total, nthreads, gpu.ms_gpu, gpu.dispatches, write_ms, gpu.bytes_out / 1e6);
+        std::printf("  file read %.0f ms across %d thread(s) + decode %.0f ms across %d thread(s), GPU upload+encode+readback %.0f ms in %d dispatch(es), file writes %.0f ms (own thread) + sync %.0f ms, output %.1f MB, memory budget %d MB\n",
+                    read_total, nreaders, dec_total, nthreads, gpu.ms_gpu, gpu.dispatches, write_ms, sync_ms, gpu.bytes_out / 1e6, cli.mem_mb);
+        std::printf("  shaders: %d compiled, %d from cache, %.0f ms\n", gpu.shaders_built, gpu.shaders_cached, gpu.ms_shader);
         if (cli.pack && pack_ok)
             std::printf("  archive %s: %zu entries (%d sharing identical data), %.1f MB\n", cli.out.c_str(),
                         pack_writer.ents.size(), pack_writer.shared, pack_writer.pos / 1e6);

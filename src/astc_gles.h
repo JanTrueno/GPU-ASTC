@@ -13,6 +13,7 @@ struct Options {
     bool alpha = false;      // encode alpha (RGBA endpoints)
     bool premultiplied = false; // colour already multiplied by alpha
     bool normal_map = false; // force B and A to 1.0
+    std::string cache_dir;   // where compiled shaders are kept between runs; empty = no cache
     int quality = 1;         // 4x4 search effort: 0 one colour line per block, 1 also two partitions
                              // for blocks that fit badly, 2 more candidates and a lower threshold
 };
@@ -21,8 +22,10 @@ class Encoder {
 public:
     ~Encoder();
 
-    // Compiles the compute shader variant for these options.
+    // Compiles the compute shader variant for these options, or loads the compiled program a
+    // previous run left in Options::cache_dir (same shader source, same driver).
     bool create(const Options& opt, std::string* log = nullptr);
+    bool from_cache() const { return from_cache_; }
     void destroy();
 
     // Encodes an RGBA8 texture. out_buffer must be a GL buffer; it is
@@ -41,6 +44,7 @@ public:
 
 private:
     GLuint program_ = 0;
+    bool from_cache_ = false;
     GLint loc_tex_size_ = -1;
     GLint loc_blocks_ = -1;
     GLint loc_count_ = -1;
