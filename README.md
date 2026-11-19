@@ -55,11 +55,17 @@ unrelated colours (and hard edges at 5x5 / 6x6) still look worse than astcenc. O
 screenshots and sprites, 4x4 lands about 3 dB under astcenc's fast preset (2 to 6 dB per image), 5x5 and
 6x6 about 4 dB.
 
-Measured on Mali-G31 (1 Mpx images, upload + encode + readback, one image per run). Arm's driver (RG351P):
-4x4 takes 25 to 40 ms with `-q fast`, 40 to 70 ms with `-q normal`; 5x5 and 6x6 take 20 to 70 ms. Mesa's
-Panfrost (RG-34XXSP): 4x4 takes 35 to 60 ms with `-q fast`, 60 to 110 ms with `-q normal`; 5x5 and 6x6 take
-30 to 100 ms. In a batch the two-partition search of `-q normal` adds 70 to 80 % to the GPU time of `-q fast`
-on Panfrost; use `-q fast` if speed matters more. The pixels go to the shader through a buffer: uploading a
+Measured on Mali-G31 with a batch of 12 images of 1 Mpx (photo, sprite sheets, screenshot), GPU time for
+upload + encode + readback in ms, against the encoder this one started from:
+
+| | 4x4 `-q fast` | 4x4 `-q normal` | 5x5 | 6x6 | before: 4x4 / 5x5 / 6x6 |
+|---|---|---|---|---|---|
+| Arm's driver (RG351P) | 380 | 545 | 410 | 445 | 540 / 590 / 545 |
+| Mesa Panfrost (RG-34XXSP) | 510 | 780 | 635 | 645 | 775 / 690 / 610 |
+
+Time batches, not single images: the first dispatch of a run carries one-time costs. With the shader cache a
+repeat run of that batch takes about 1.1 s in all on the RG351P (2.9 s before, most of it compiling).
+The pixels go to the shader through a buffer: uploading a
 texture for a single image took 35 to 40 ms per megapixel on Arm's driver. `GPUASTC_INPUT=texture` goes back
 to a texture, `GPUASTC_TIMING=1` reports the GPU stages separately, `GPUASTC_SHADER=<file>` replaces the
 built-in shader source.
