@@ -204,6 +204,10 @@ void Encoder::destroy()
         glDeleteProgram(program_);
         program_ = 0;
     }
+    if (in_buffer_) {
+        glDeleteBuffers(1, &in_buffer_);
+        in_buffer_ = 0;
+    }
 }
 
 bool Encoder::create(const Options& opt, std::string* log)
@@ -216,6 +220,7 @@ bool Encoder::create(const Options& opt, std::string* log)
     src += std::string("#define HAS_ALPHA ") + (opt.alpha ? "1" : "0") + "\n";
     src += std::string("#define PREMULTIPLIED ") + (opt.alpha && opt.premultiplied ? "1" : "0") + "\n";
     src += std::string("#define IS_NORMALMAP ") + (opt.normal_map ? "1" : "0") + "\n";
+    src += std::string("#define INPUT_BUFFER ") + (opt.input_buffer ? "1" : "0") + "\n";
     if (opt.quality <= 0)
         src += "#define USE_PARTITIONS 0\n";
     else if (opt.quality >= 2)
@@ -289,11 +294,35 @@ bool Encoder::create(const Options& opt, std::string* log)
     return true;
 }
 
+bool Encoder::buffer_input_fits(int width, int height)
+{
+    GLint64 max_block = 0;
+    glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &max_block);
+    return (GLint64)width * height * 4 <= max_block;
+}
+
 bool Encoder::encode(GLuint tex, int width, int height, GLuint out_buffer)
 {
-    if (!program_ || width <= 0 || height <= 0)
+    if (!program_ || opt_.input_buffer || width <= 0 || height <= 0)
         return false;
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    return dispatch(width, height, out_buffer);
+}
 
+bool Encoder::encode_pixels(const uint8_t* rgba, int width, int height, GLuint out_buffer)
+{
+    if (!program_ || !opt_.input_buffer || width <= 0 || height <= 0)
+        return false;
+    if (!in_buffer_) glGenBuffers(1, &in_buffer_);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, in_buffer_);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)width * height * 4, rgba, GL_STREAM_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, in_buffer_);
+    return dispatch(width, height, out_buffer);
+}
+
+bool Encoder::dispatch(int width, int height, GLuint out_buffer)
+{
     const int bx = blocks(width, opt_.block);
     const int by = blocks(height, opt_.block);
 
@@ -305,9 +334,8 @@ bool Encoder::encode(GLuint tex, int width, int height, GLuint out_buffer)
         const GLuint table = partition_texture();
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, table);
+        glActiveTexture(GL_TEXTURE0);
     }
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex);
 
     glUseProgram(program_);
     glUniform2i(loc_tex_size_, width, height);

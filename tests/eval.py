@@ -24,6 +24,8 @@ def gpu(ctx, rgba, block, alpha, n=5):
     prog = ctx.compute_shader(t.shader_source(block, alpha, extra=EXTRA))
     tex = ctx.texture((w, h), 4, np.ascontiguousarray(rgba).tobytes()); tex.filter = (moderngl.NEAREST,) * 2; tex.use(0); t.bind_lut(ctx)
     bx, by = (w + block - 1) // block, (h + block - 1) // block
+    if "INPUT_BUFFER 1" in EXTRA:  # the shader reads the pixels from a buffer at binding 1
+        ctx.buffer(np.ascontiguousarray(rgba).tobytes()).bind_to_storage_buffer(1)
     buf = ctx.buffer(reserve=bx * by * 16); buf.bind_to_storage_buffer(0)
     prog["uTexSize"].value = (w, h); prog["uBlocks"].value = (bx, by)
     if "uN" in prog: prog["uN"].value = block * block

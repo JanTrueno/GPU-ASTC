@@ -30,6 +30,9 @@ precision highp usampler2D;
 #ifndef IS_NORMALMAP
 #define IS_NORMALMAP 0
 #endif
+#ifndef INPUT_BUFFER
+#define INPUT_BUFFER 0 // 1: the source pixels come from a buffer (one uint per texel), not a texture
+#endif
 #ifndef USE_PARTITIONS
 #define USE_PARTITIONS 1 // 4x4 only; needs the partition table texture (uPartLut)
 #endif
@@ -130,7 +133,13 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 uniform ivec2 uTexSize;   // source size in texels
 uniform ivec2 uBlocks;    // size in blocks
 uniform int uN;           // BLOCK_SIZE (non-constant so loops are not unrolled)
+#if INPUT_BUFFER
+// Uploading a texture is slow on some drivers (Mali: 35-40 ms per megapixel, more than encoding
+// it); a buffer is a plain copy. Row-major, R in the low byte.
+layout(std430, binding = 1) readonly buffer InBuffer { uint pixels[]; };
+#else
 layout(binding = 0) uniform highp sampler2D uTex;
+#endif
 #if TWO_PARTITIONS
 // 256x256, R32UI: for every 16 bit "which side is each texel on" mask, the closest 2-partition
 // pattern the format offers: seed in bits 0-9, number of texels that differ in bits 10-14,
@@ -254,12 +263,20 @@ TV texel(int k)
     int x = k - y * DIM;
     // replicate edge texels for partial blocks
     ivec2 p = min(g_origin + ivec2(x, y), uTexSize - ivec2(1));
+#if INPUT_BUFFER
+    uint v = pixels[p.y * uTexSize.x + p.x];
+#if IS_NORMALMAP
+    v |= 0xFFFF0000u;
+#endif
+    return TV_FROM4(vec4(uvec4(v, v >> 8u, v >> 16u, v >> 24u) & 255u));
+#else
     vec4 t = texelFetch(uTex, p, 0);
 #if IS_NORMALMAP
     t.b = 1.0;
     t.a = 1.0;
 #endif
     return TV_FROM4(t) * 255.0;
+#endif
 }
 
 // Error metric used to choose between encodings. With straight alpha the RGB error counts in

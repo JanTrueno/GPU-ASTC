@@ -487,7 +487,8 @@ bool has_extension(const char* name)
 }
 
 struct Gpu {
-    std::map<std::pair<int, int>, std::unique_ptr<gpuastc::Encoder>> encoders; // (block, alpha | premult << 1)
+    std::map<std::pair<int, int>, std::unique_ptr<gpuastc::Encoder>> encoders; // (block, alpha | premult << 1 | buffer input << 2)
+    bool buffer_input = false; // the shader reads the pixels from a buffer, not a texture (set in main)
     GLuint tex = 0, buf = 0;
     WriteQueue* writer = nullptr; // finished files go here; a writer thread saves them
     int max_height = 4096; // tallest atlas we build
@@ -495,6 +496,10 @@ struct Gpu {
     bool normal = false, upload = false, verbose = false;
     int quality = 1;
     std::string cache_dir;
+    // GPUASTC_TIMING=1: wait for the GPU after each stage and report the stages separately
+    // (the waits themselves cost a little, so the total is slightly higher than without it)
+    bool stage_timing = std::getenv("GPUASTC_TIMING") != nullptr;
+    double ms_upload = 0, ms_compute = 0, ms_map = 0;
     double ms_shader = 0; // compiling or loading the shader variants
     int shaders_cached = 0, shaders_built = 0;
 
@@ -503,9 +508,9 @@ struct Gpu {
     long long pixels = 0, bytes_out = 0;
     int files_ok = 0, files_failed = 0, dispatches = 0;
 
-    gpuastc::Encoder* encoder(int block, bool alpha, bool premult)
+    gpuastc::Encoder* encoder(int block, bool alpha, bool premult, bool from_buffer)
     {
-        auto key = std::make_pair(block, (alpha ? 1 : 0) | (premult ? 2 : 0));
+        auto key = std::make_pair(block, (alpha ? 1 : 0) | (premult ? 2 : 0) | (from_buffer ? 4 : 0));
         auto it = encoders.find(key);
         if (it != encoders.end()) return it->second.get();
         std::unique_ptr<gpuastc::Encoder> e(new gpuastc::Encoder());
@@ -516,6 +521,7 @@ struct Gpu {
         o.normal_map = normal;
         o.quality = quality;
         o.cache_dir = cache_dir;
+        o.input_buffer = from_buffer;
         std::string log;
         const double t0 = now_ms();
         const bool created = e->create(o, &log);
@@ -566,8 +572,6 @@ bool flush_pack(Gpu& g, Pack& p)
     if (p.jobs.empty()) return true;
 
     const int block = p.block;
-    gpuastc::Encoder* enc = g.encoder(block, p.alpha, p.premult);
-    if (!enc) { g.files_failed += (int)p.jobs.size(); p.clear(); return false; }
 
     const bool single = p.jobs.size() == 1;
     int W = 0, H = 0;
@@ -601,11 +605,24 @@ bool flush_pack(Gpu& g, Pack& p)
         return false;
     }
 
+    const bool from_buffer = g.buffer_input && gpuastc::Encoder::buffer_input_fits(W, H);
+    gpuastc::Encoder* enc = g.encoder(block, p.alpha, p.premult, from_buffer);
+    if (!enc) { g.files_failed += (int)p.jobs.size(); p.clear(); return false; }
+
     const double t0 = now_ms();
-    glBindTexture(GL_TEXTURE_2D, g.tex);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-    if (!enc->encode(g.tex, W, H, g.buf)) {
+    double t_up = t0;
+    bool encoded;
+    if (from_buffer) {
+        encoded = enc->encode_pixels(data, W, H, g.buf);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, g.tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+        if (g.stage_timing) { glFinish(); t_up = now_ms(); g.ms_upload += t_up - t0; }
+        encoded = enc->encode(g.tex, W, H, g.buf);
+    }
+    if (g.stage_timing) { glFinish(); const double t = now_ms(); g.ms_compute += t - t_up; t_up = t; }
+    if (!encoded) {
         std::fprintf(stderr, "dispatch failed (GL error 0x%x)\n", glGetError());
         g.files_failed += (int)p.jobs.size();
         p.clear();
@@ -624,6 +641,7 @@ bool flush_pack(Gpu& g, Pack& p)
     }
     const double t1 = now_ms();
     g.ms_gpu += t1 - t0;
+    if (g.stage_timing) g.ms_map += t1 - t_up;
     ++g.dispatches;
 
     for (size_t k = 0; k < p.jobs.size(); ++k) {
@@ -772,6 +790,19 @@ int main(int argc, char** argv)
     gpu.upload = cli.upload;
     gpu.verbose = cli.verbose;
     gpu.quality = cli.quality;
+    {
+        // How the pixels reach the shader. Arm's Mali driver takes 35-40 ms to upload a 1 Mpx
+        // texture, more than encoding it, and a buffer avoids that. Mesa uploads quickly and its
+        // Panfrost driver reads a buffer more slowly than a texture, so it keeps the texture.
+        // GPUASTC_INPUT=texture|buffer overrides the choice.
+        const char* version = (const char*)glGetString(GL_VERSION);
+        const char* forced = std::getenv("GPUASTC_INPUT");
+        gpu.buffer_input = !(version && std::strstr(version, "Mesa"));
+        if (forced && !std::strcmp(forced, "texture")) gpu.buffer_input = false;
+        if (forced && !std::strcmp(forced, "buffer")) gpu.buffer_input = true;
+        if (cli.verbose)
+            std::printf("input: %s\n", gpu.buffer_input ? "buffer" : "texture");
+    }
     if (cli.use_cache) {
         if (cli.cache.empty()) {
             const char* xdg = std::getenv("XDG_CACHE_HOME");
@@ -1047,6 +1078,8 @@ int main(int argc, char** argv)
         std::printf("  file read %.0f ms across %d thread(s) + decode %.0f ms across %d thread(s), GPU upload+encode+readback %.0f ms in %d dispatch(es), file writes %.0f ms (own thread) + sync %.0f ms, output %.1f MB, memory budget %d MB\n",
                     read_total, nreaders, dec_total, nthreads, gpu.ms_gpu, gpu.dispatches, write_ms, sync_ms, gpu.bytes_out / 1e6, cli.mem_mb);
         std::printf("  shaders: %d compiled, %d from cache, %.0f ms\n", gpu.shaders_built, gpu.shaders_cached, gpu.ms_shader);
+        if (gpu.stage_timing)
+            std::printf("  GPU stages: upload %.0f ms, encode %.0f ms, map %.0f ms\n", gpu.ms_upload, gpu.ms_compute, gpu.ms_map);
         if (cli.pack && pack_ok)
             std::printf("  archive %s: %zu entries (%d sharing identical data), %.1f MB\n", cli.out.c_str(),
                         pack_writer.ents.size(), pack_writer.shared, pack_writer.pos / 1e6);

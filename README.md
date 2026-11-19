@@ -55,9 +55,12 @@ unrelated colours (and hard edges at 5x5 / 6x6) still look worse than astcenc. O
 screenshots and sprites, 4x4 lands about 3 dB under astcenc's fast preset (2 to 6 dB per image), 5x5 and
 6x6 about 4 dB.
 
-Measured on Mali-G31 (1 Mpx images, upload + encode + readback): 5x5 and 6x6 take 55 to 95 ms, 4x4 takes
-55 to 70 ms with `-q fast` and 75 to 100 ms with `-q normal` on Arm's driver. On Panfrost the two-partition
-search is much slower (120 to 200 ms); use `-q fast` there if speed matters more.
+Measured on Mali-G31 with Arm's driver (RG351P, 1 Mpx images, upload + encode + readback): 4x4 takes 25 to
+40 ms with `-q fast`, 40 to 70 ms with `-q normal`; 5x5 and 6x6 take 25 to 65 ms. On that driver the pixels
+go to the shader through a buffer: uploading them as a texture alone took 35 to 40 ms per megapixel. Mesa
+uploads textures quickly and keeps the texture path. On Panfrost the two-partition search is much slower
+(4x4 `-q normal` 110 to 220 ms against 45 to 80 ms for `-q fast`); use `-q fast` there if speed matters more.
+`GPUASTC_INPUT=texture|buffer` overrides the input path, `GPUASTC_TIMING=1` reports the GPU stages separately.
 `GPUASTC_SHADER_DEFINES="NAME=VALUE;..."` overrides the shader's tuning defines (`ALT_ERR_THRESHOLD`,
 `PART_CANDIDATES`, `PART_MAX_MISMATCH`, `GRID_SMOOTH`, `GRID_ERR_THRESHOLD`, `USE_GRID`) for experiments.
 
