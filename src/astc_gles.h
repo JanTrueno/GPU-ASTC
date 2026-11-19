@@ -13,6 +13,8 @@ struct Options {
     bool alpha = false;      // encode alpha (RGBA endpoints)
     bool premultiplied = false; // colour already multiplied by alpha
     bool normal_map = false; // force B and A to 1.0
+    int quality = 1;         // 4x4 search effort: 0 one colour line per block, 1 also two partitions
+                             // for blocks that fit badly, 2 more candidates and a lower threshold
 };
 
 class Encoder {

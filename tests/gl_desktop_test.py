@@ -1,7 +1,7 @@
 """Runs shaders/astc_encode.comp on desktop OpenGL 4.3 (as #version 430), decodes the
 result with astcenc and reports PSNR. Validates the algorithm and bit packing, not
 GLSL ES compile rules. Needs: moderngl, astc-encoder-py, pillow, numpy."""
-import sys, pathlib, math
+import sys, os, pathlib, math
 import numpy as np
 import moderngl
 from PIL import Image
@@ -10,7 +10,7 @@ import astc_encoder as ae
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 def shader_source(block, alpha, normal=False, premult=False, extra=""):
-    body = (ROOT / "shaders/astc_encode.comp").read_text()
+    body = pathlib.Path(os.environ.get("GPUASTC_SHADER", ROOT / "shaders/astc_encode.comp")).read_text()
     head = (f"#version 430\n#define BLOCK_DIM {block}\n#define HAS_ALPHA {int(alpha)}\n#define IS_NORMALMAP {int(normal)}\n"
             f"#define PREMULTIPLIED {int(premult)}\n{extra}")
     return head + body

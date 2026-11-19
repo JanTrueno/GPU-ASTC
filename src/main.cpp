@@ -59,6 +59,8 @@ void usage()
         "  -b auto|4|5|6     block size (default auto: 4x4 up to 256x256, thin or alpha textures;\n"
         "                    5x5 up to 2048x2048; 6x6 above)\n"
         "  -alpha auto|on|off  encode alpha (default auto: on if any alpha < 255)\n"
+        "  -q fast|normal|best  4x4 search effort (default normal). fast: one colour line per block.\n"
+        "                    normal: blocks that fits badly also try two partitions. best: more of that.\n"
         "  -norm             normal map (B and A forced to 1)\n"
         "  -j N              decoder threads in batch mode (default: cores - 1)\n"
         "  -mem MB           memory for images waiting between reading, encoding and saving (default 384;\n"
@@ -75,6 +77,7 @@ void usage()
 struct Cli {
     int block = 0;      // 0 = auto
     int alpha_mode = 0; // 0 auto, 1 on, 2 off
+    int quality = 1;    // 0 fast, 1 normal, 2 best
     bool normal = false;
     bool upload = false;
     bool verbose = false;
@@ -418,6 +421,7 @@ struct Gpu {
     int max_height = 4096; // tallest atlas we build
     int max_tex = 2048;
     bool normal = false, upload = false, verbose = false;
+    int quality = 1;
 
     // statistics
     double ms_gpu = 0;
@@ -435,6 +439,7 @@ struct Gpu {
         o.alpha = alpha;
         o.premultiplied = premult;
         o.normal_map = normal;
+        o.quality = quality;
         std::string log;
         if (!e->create(o, &log)) {
             std::fprintf(stderr, "shader error (%dx%d, alpha %d):\n%s\n", block, block, alpha ? 1 : 0, log.c_str());
@@ -622,6 +627,10 @@ int main(int argc, char** argv)
             const char* v = argv[++i];
             cli.alpha_mode = !std::strcmp(v, "on") ? 1 : !std::strcmp(v, "off") ? 2 : 0;
         }
+        else if (!std::strcmp(argv[i], "-q") && i + 1 < argc) {
+            const char* v = argv[++i];
+            cli.quality = !std::strcmp(v, "fast") ? 0 : !std::strcmp(v, "best") ? 2 : 1;
+        }
         else if (!std::strcmp(argv[i], "-j") && i + 1 < argc) cli.threads = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-mem") && i + 1 < argc) cli.mem_mb = std::max(16, std::atoi(argv[++i]));
         else if (!std::strcmp(argv[i], "-update")) cli.update = true; // now the default
@@ -679,6 +688,7 @@ int main(int argc, char** argv)
     gpu.normal = cli.normal;
     gpu.upload = cli.upload;
     gpu.verbose = cli.verbose;
+    gpu.quality = cli.quality;
     GLint max_tex = 2048;
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
     gpu.max_tex = (int)max_tex;
