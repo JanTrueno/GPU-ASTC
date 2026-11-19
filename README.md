@@ -5,6 +5,10 @@ without a window system (the GLES context comes from SDL2: KMSDRM or offscreen).
 
 It's what compresses Terraria's textures on the handheld itself in our PortMaster port.
 It also runs on desktop Linux (Mesa, llvmpipe), and its output decodes correctly with astcenc.
+Checked by decoding what each device wrote and comparing it with the desktop result: Mali-G31 (Arm's driver
+and Mesa Panfrost), Mali-T860 (Arm r18), Adreno 650 (Mesa freedreno) and PowerVR Rogue GE8300. The `-upload`
+self-test only shows that the GPU accepts the blocks; on a new driver also decode a result and look at it,
+two of those five needed a fix that the self-test did not show.
 
 ## Usage
 
