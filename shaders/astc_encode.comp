@@ -777,12 +777,12 @@ bool encode_grid(TV e0, TV e1, inout float best, out uvec4 blk)
     TV dn = d * inv;
     vec4 a0 = vec4(0.0), a1 = vec4(0.0), a2 = vec4(0.0), a3 = vec4(0.0);
     int i = 0;
-    for (float fy = 0.0; i < uN; fy += 1.0)
+    for (int gy = 0; i < uN; ++gy) // an int counter: PowerVR's compiler (1.19) gets a float one wrong here
     {
         vec4 row = vec4(0.0);
         for (int col = 0; col < DIM; ++col, ++i)
             row += max(1.0 - abs(float(col) - GRID_CELL), 0.0) * dot(dn, texel(i) - e0);
-        vec4 wy = max(1.0 - abs(fy - GRID_CELL), 0.0);
+        vec4 wy = max(1.0 - abs(float(gy) - GRID_CELL), 0.0);
         a0 += wy.x * row;
         a1 += wy.y * row;
         a2 += wy.z * row;
