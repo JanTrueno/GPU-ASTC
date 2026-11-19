@@ -107,7 +107,6 @@ precision highp usampler2D;
 #define MODE_4x4_Q10 0x241u
 #define MODE_4x4_Q16 0x242u
 #define CEM_LDR_LUMA_DIRECT 0u
-#define MODE_4x4_Q3  0x051u
 #define MODE_4x4_Q4  0x042u
 #define MODE_4x4_Q5  0x052u
 #define MODE_4x4_Q2_DUAL 0x441u

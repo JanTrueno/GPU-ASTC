@@ -13,7 +13,11 @@ img = ae.ASTCImage(ae.ASTCType.U8, w, h, 1); img.data = rgba.tobytes()
 ref = c.compress(img, ae.ASTCSwizzle.from_str("RGBA"))
 def berr(data):
     dec = t.decode(data, w, h, b)[0]
-    e = ((rgba.astype(float) - dec) ** 2).sum(-1)
+    a = rgba.astype(float); d = dec.astype(float)
+    if has_a:  # as eval.py scores alpha images: premultiplied colour + alpha
+        a = np.concatenate([a[..., :3] * a[..., 3:4] / 255.0, a[..., 3:4]], -1)
+        d = np.concatenate([d[..., :3] * d[..., 3:4] / 255.0, d[..., 3:4]], -1)
+    e = ((a - d) ** 2).sum(-1)
     return e.reshape(h // 4, 4, w // 4, 4).sum((1, 3)).reshape(-1)
 em, er = berr(mine), berr(ref)
 v = (rgba[..., 0].astype(np.int64) << 24) | (rgba[..., 1].astype(np.int64) << 16) | (rgba[..., 2].astype(np.int64) << 8) | rgba[..., 3]
