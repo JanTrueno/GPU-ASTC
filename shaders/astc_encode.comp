@@ -728,7 +728,10 @@ uvec4 encode_block(out float err, out float round_err, out bool opaque, out TV e
 #endif
 
     uvec4 blk = uvec4(0u);
-    blk.x = mode | ((opaque ? CEM_LDR_RGB_DIRECT : CEM_LDR_RGBA_DIRECT) << 13u);
+    // A choice between two literals goes into a variable before it is shifted: Arm's old
+    // Mali-T860 compiler (r18) otherwise works it out in 16 bits and the top bit is lost.
+    uint cem = opaque ? CEM_LDR_RGB_DIRECT : CEM_LDR_RGBA_DIRECT;
+    blk.x = mode | (cem << 13u);
     uint pos = 17u;
     put_endpoints(blk, pos, e0, e1, ebits, !opaque);
     put_weights(blk, ws);
@@ -1084,8 +1087,11 @@ bool encode_two_partitions_big(uint seed, uvec2 pm, inout float best, out uvec4 
     // a swapped pair: the weights of that group's texels change sides. The pattern as one bit
     // per texel in texel order, like the weights:
     uvec2 g1 = uvec2(pm.x | (pm.y << uint(3 * DIM)), pm.y >> uint(32 - 3 * DIM));
-    const uvec2 all = uvec2((BLOCK_SIZE >= 32) ? 0xFFFFFFFFu : ((1u << uint(BLOCK_SIZE & 31)) - 1u),
-                            (BLOCK_SIZE > 32) ? ((1u << uint(BLOCK_SIZE - 32)) - 1u) : 0u);
+#if BLOCK_DIM == 5
+    const uvec2 all = uvec2(0x1FFFFFFu, 0u);
+#else
+    const uvec2 all = uvec2(0xFFFFFFFFu, 0xFu);
+#endif
     if (flip0) ws ^= all ^ g1;
     if (flip1) ws ^= g1;
 
@@ -1240,8 +1246,9 @@ bool encode_two_partitions(uint lut, bool opaque, inout float best, out uvec4 bl
 
     // block mode, partition count - 1, seed, 2 bits "same endpoint type for both", endpoint type
     blk = uvec4(0u);
-    blk.x = (opaque ? MODE_4x4_Q3 : MODE_4x4_Q4) | (1u << 11u) | ((lut & 1023u) << 13u)
-          | ((opaque ? CEM_LDR_RGB_DIRECT : CEM_LDR_RGBA_DIRECT) << 25u);
+    uint mode = opaque ? MODE_4x4_Q3 : MODE_4x4_Q4;
+    uint cem = opaque ? CEM_LDR_RGB_DIRECT : CEM_LDR_RGBA_DIRECT; // in a variable: see encode_block
+    blk.x = mode | (1u << 11u) | ((lut & 1023u) << 13u) | (cem << 25u);
     uint pos = 29u;
     put_endpoints(blk, pos, q0, q1, ebits, !opaque);
     put_endpoints(blk, pos, q2, q3, ebits, !opaque);
@@ -1441,7 +1448,11 @@ void main()
             if (y < 3) { gy.x |= rb.x; gz.x |= rb.y; }
             else       { gy.y |= rb.x; gz.y |= rb.y; }
         }
-        const uvec2 rows = uvec2((1u << uint(3 * DIM)) - 1u, (1u << uint((DIM - 3) * DIM)) - 1u);
+#if BLOCK_DIM == 5
+        const uvec2 rows = uvec2(0x7FFFu, 0x3FFu);   // three rows, two rows
+#else
+        const uvec2 rows = uvec2(0x3FFFFu, 0x3FFFFu); // three rows each
+#endif
         uvec3 seed;
         uvec2 pz, px, py;
         uvec3 miss = uvec3(nearest_big(gz, seed.x, pz), nearest_big(rows ^ gy ^ gz, seed.y, px), nearest_big(gy, seed.z, py));
