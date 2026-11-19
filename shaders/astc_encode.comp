@@ -736,87 +736,92 @@ uvec4 encode_block(out float err, out float round_err, out bool opaque, out TV e
 // ---------------------------------------------------------------------------
 
 #if GRID_MODE
-// Wanted weight of grid cell i: the projection of the texels around it onto the endpoint line.
-float grid_weight(int i, TV e0, TV dn)
-{
-    int gx = i & 3;
-    int gy = i >> 2;
+// Where the four grid cells of a row (or column) sit, in texel coordinates. A texel's projection
+// counts for a cell by 1 - distance (never for more than two cells per axis).
 #if BLOCK_DIM == 6
-    // cell (gx, gy) covers texels x0..x0+1, y0..y0+1 with x0, y0 in {0,1,3,4}; the nearer the
-    // texel the larger its share (4/9, 2/9, 2/9, 1/9)
-    int x0 = gx + (gx >> 1);
-    int y0 = gy + (gy >> 1);
-    int px = gx & 1; // odd cells: the first tap is the far one
-    int py = gy & 1;
-    int base = y0 * 6 + x0;
-    vec2 fx = (px == 0) ? vec2(2.0, 1.0) : vec2(1.0, 2.0);
-    vec2 fy = (py == 0) ? vec2(2.0, 1.0) : vec2(1.0, 2.0);
-    return (dot(dn, texel(base) - e0)     * (fx.x * fy.x)
-          + dot(dn, texel(base + 1) - e0) * (fx.y * fy.x)
-          + dot(dn, texel(base + 6) - e0) * (fx.x * fy.y)
-          + dot(dn, texel(base + 7) - e0) * (fx.y * fy.y)) * (1.0 / 9.0);
+const vec4 GRID_CELL = vec4(1.0 / 3.0, 5.0 / 3.0, 10.0 / 3.0, 14.0 / 3.0);
 #else
-    // grid cell g sits at texel coordinate g * 4/3: x0 = floor, fraction in thirds
-    int x0 = min((gx * 4) / 3, 3);
-    int y0 = min((gy * 4) / 3, 3);
-    float fx = float(gx * 4 - 3 * x0) * (1.0 / 3.0);
-    float fy = float(gy * 4 - 3 * y0) * (1.0 / 3.0);
-    int base = y0 * 5 + x0;
-    return dot(dn, texel(base) - e0)     * ((1.0 - fx) * (1.0 - fy))
-         + dot(dn, texel(base + 1) - e0) * (fx * (1.0 - fy))
-         + dot(dn, texel(base + 5) - e0) * ((1.0 - fx) * fy)
-         + dot(dn, texel(base + 6) - e0) * (fx * fy);
+const vec4 GRID_CELL = vec4(0.0, 4.0 / 3.0, 8.0 / 3.0, 4.0);
 #endif
-}
 
-// Grid weight k as the decoder sees it, 0..64 (gu: one byte per weight).
-float grid_value(uvec4 gu, int k)
+// One row of wanted grid weights -> stored indices (4 bits each) and decoder values (a byte each).
+void grid_row(vec4 w, out uint q4, out uint u8)
 {
-    k = min(k, 15);
-    return float((gu[k >> 2] >> uint(8 * (k & 3))) & 255u);
+    uvec4 q = uvec4(clamp(w, 0.0, 1.0) * 11.0 + 0.5);
+    q4 = q.x | (q.y << 4u) | (q.z << 8u) | (q.w << 12u);
+    u8 = uint(unquant_weight(q.x, true) * 64.0 + 0.5) | (uint(unquant_weight(q.y, true) * 64.0 + 0.5) << 8u)
+       | (uint(unquant_weight(q.z, true) * 64.0 + 0.5) << 16u) | (uint(unquant_weight(q.w, true) * 64.0 + 0.5) << 24u);
 }
 
-uvec4 encode_grid(TV e0, TV e1, out float err)
+// best: the error to beat; the block is only packed (and true returned) when the grid is better.
+bool encode_grid(TV e0, TV e1, float best, out uvec4 blk)
 {
     TV d = e1 - e0;
     float dd = dot(d, d);
     float inv = 1.0 / max(dd, SMALL_VALUE);
 
-    // pass 1: the 16 grid weights. gq: the stored index, 4 bits each; gu: the decoder's value
-    uvec2 gq = uvec2(0u);
-    uvec4 gu = uvec4(0u);
-    int cells = min(uN, 16); // 16, but not a compile-time constant: keeps the loop rolled
-    for (int i = 0; i < cells; ++i)
+    // pass 1: the 16 wanted grid weights. Every texel is read once; its projection onto the
+    // endpoint line is spread over the cells of its row, and each finished row over the grid rows.
+    TV dn = d * inv;
+    vec4 a0 = vec4(0.0), a1 = vec4(0.0), a2 = vec4(0.0), a3 = vec4(0.0);
+    int i = 0;
+    for (float fy = 0.0; i < uN; fy += 1.0)
     {
-        uint q = uint(clamp(grid_weight(i, e0, d * inv), 0.0, 1.0) * 11.0 + 0.5);
-        gu[i >> 2] |= uint(unquant_weight(q, true) * 64.0 + 0.5) << uint(8 * (i & 3));
-        q <<= uint(4 * (i & 7));
-        if (i < 8) gq.x |= q; else gq.y |= q;
+        vec4 row = vec4(0.0);
+        for (int col = 0; col < DIM; ++col, ++i)
+            row += max(1.0 - abs(float(col) - GRID_CELL), 0.0) * dot(dn, texel(i) - e0);
+        vec4 wy = max(1.0 - abs(fy - GRID_CELL), 0.0);
+        a0 += wy.x * row;
+        a1 += wy.y * row;
+        a2 += wy.z * row;
+        a3 += wy.w * row;
+    }
+    // gq: the stored index, 4 bits each; gu: the decoder's value (0..64), one byte each, one row
+    // per component
+    uvec2 gq;
+    uvec4 gu;
+    {
+        uint qa, qb;
+        grid_row(a0, qa, gu.x);
+        grid_row(a1, qb, gu.y);
+        gq.x = qa | (qb << 16u);
+        grid_row(a2, qa, gu.z);
+        grid_row(a3, qb, gu.w);
+        gq.y = qa | (qb << 16u);
     }
 
     // pass 2: every texel with the weight the decoder interpolates for it (ASTC weight infill)
     float sw = 0.0, sww = 0.0, sp = 0.0, swp = 0.0, scc = 0.0;
-    for (int i = 0; i < uN; ++i)
+    // position in the grid in 1/16 cells: scale = (1024 + DIM / 2) / (DIM - 1), 3 = grid size - 1
+    const int scale = 3 * ((1024 + DIM / 2) / (DIM - 1));
+    i = 0;
+    for (int y = 0; i < uN; ++y)
     {
-        int y = i / DIM;
-        int x = i - y * DIM;
-        // position in the grid in 1/16 cells: scale = (1024 + DIM / 2) / (DIM - 1), 3 = grid size - 1
-        ivec2 g = (ivec2(x, y) * (3 * ((1024 + DIM / 2) / (DIM - 1))) + 32) >> 6;
-        ivec2 j = g >> 4;
-        ivec2 f = g & 15;
-        int k = j.y * 4 + j.x;
-        int w11 = (f.x * f.y + 8) >> 4;
-        float wu = floor((grid_value(gu, k)     * float(16 - f.x - f.y + w11)
-                        + grid_value(gu, k + 1) * float(f.x - w11)
-                        + grid_value(gu, k + 4) * float(f.y - w11)
-                        + grid_value(gu, k + 5) * float(w11) + 8.0) * (1.0 / 16.0)) * (1.0 / 64.0);
-        TV c = texel(i) - e0;
-        float pc = dot(c, d);
-        sw += wu;
-        sww += wu * wu;
-        sp += pc;
-        swp += wu * pc;
-        scc += dot(c, c);
+        int gy = (y * scale + 32) >> 6;
+        uint fy = uint(gy & 15);
+        // the two grid rows around this texel row. Past the last row or column the fraction is
+        // 0, so what is read there does not count.
+        uint row0 = gu[gy >> 4];
+        uint row1 = gu[((gy >> 4) + 1) & 3];
+        for (int x = 0; x < DIM; ++x, ++i)
+        {
+            int gx = (x * scale + 32) >> 6;
+            uint fx = uint(gx & 15);
+            // shifted so the low two bytes are the weights left and right of the texel
+            uint r0 = row0 >> uint(8 * (gx >> 4));
+            uint r1 = row1 >> uint(8 * (gx >> 4));
+            uint w11 = (fx * fy + 8u) >> 4u;
+            uint wi = (r0 & 255u) * (16u - fx - fy + w11) + ((r0 >> 8u) & 255u) * (fx - w11)
+                    + (r1 & 255u) * (fy - w11) + ((r1 >> 8u) & 255u) * w11;
+            float wu = float((wi + 8u) >> 4u) * (1.0 / 64.0);
+            TV c = texel(i) - e0;
+            float pc = dot(c, d);
+            sw += wu;
+            sww += wu * wu;
+            sp += pc;
+            swp += wu * pc;
+            scc += dot(c, c);
+        }
     }
 
     // refit along the line and error, as in encode_block
@@ -846,7 +851,9 @@ uvec4 encode_grid(TV e0, TV e1, out float err)
             b = 1.0;
         }
     }
-    err = scc - 2.0 * (a * r0 + b * swp) + a * a * al + 2.0 * a * b * be + b * b * ga;
+    float err = scc - 2.0 * (a * r0 + b * swp) + a * a * al + 2.0 * a * b * be + b * b * ga;
+    if (err >= best)
+        return false; // skip the packing
 
     uvec2 ws = uvec2(0u);
     for (int g = 0; g < 4; ++g)
@@ -855,19 +862,19 @@ uvec4 encode_grid(TV e0, TV e1, out float err)
         for (int m = 0; m < 5; ++m)
         {
             int i = g * 5 + m;
-            if (i >= cells)
+            if (i >= 16)
                 break;
             uint q = (((i < 8) ? gq.x : gq.y) >> uint(4 * (i & 7))) & 15u;
             grp |= scramble_weight(q, true) << uint(4 * m);
         }
         put2(ws, uint(g) * 18u, trit_group_bits(grp, 2u));
     }
-    uvec4 blk = uvec4(0u);
+    blk = uvec4(0u);
     blk.x = MODE_4x4_Q12 | (CEM_LDR_RGB_DIRECT << 13u);
     uint pos = 17u;
     put_endpoints(blk, pos, e0, e1, 8, false);
     put_weights(blk, ws);
-    return blk;
+    return true;
 }
 #endif
 
@@ -1197,9 +1204,8 @@ void main()
 #if GRID_MODE
     if (round_err > GRID_ERR_THRESHOLD)
     {
-        float e2;
-        uvec4 blk = encode_grid(e0, e1, e2);
-        if (e2 < err)
+        uvec4 blk;
+        if (encode_grid(e0, e1, err, blk))
             blocks[index] = blk;
     }
 #endif
