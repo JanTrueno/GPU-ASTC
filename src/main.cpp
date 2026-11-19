@@ -791,15 +791,12 @@ int main(int argc, char** argv)
     gpu.verbose = cli.verbose;
     gpu.quality = cli.quality;
     {
-        // How the pixels reach the shader. Arm's Mali driver takes 35-40 ms to upload a 1 Mpx
-        // texture, more than encoding it, and a buffer avoids that. Mesa uploads quickly and its
-        // Panfrost driver reads a buffer more slowly than a texture, so it keeps the texture.
-        // GPUASTC_INPUT=texture|buffer overrides the choice.
-        const char* version = (const char*)glGetString(GL_VERSION);
+        // How the pixels reach the shader: through a buffer. Arm's Mali driver takes 35-40 ms to
+        // upload a 1 Mpx texture, more than encoding it; on Mesa's Panfrost the two are within a
+        // few percent. GPUASTC_INPUT=texture goes back to a texture.
         const char* forced = std::getenv("GPUASTC_INPUT");
-        gpu.buffer_input = !(version && std::strstr(version, "Mesa"));
+        gpu.buffer_input = true;
         if (forced && !std::strcmp(forced, "texture")) gpu.buffer_input = false;
-        if (forced && !std::strcmp(forced, "buffer")) gpu.buffer_input = true;
         if (cli.verbose)
             std::printf("input: %s\n", gpu.buffer_input ? "buffer" : "texture");
     }

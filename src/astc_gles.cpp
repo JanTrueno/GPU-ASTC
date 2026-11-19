@@ -239,7 +239,18 @@ bool Encoder::create(const Options& opt, std::string* log)
             }
         }
     }
-    src += kShaderSource;
+    // Development hook: GPUASTC_SHADER=<file> replaces the built-in shader source.
+    std::string body = kShaderSource;
+    if (const char* path = std::getenv("GPUASTC_SHADER")) {
+        if (FILE* f = std::fopen(path, "rb")) {
+            body.clear();
+            char chunk[4096];
+            for (size_t got; (got = std::fread(chunk, 1, sizeof chunk, f)) > 0;)
+                body.append(chunk, got);
+            std::fclose(f);
+        }
+    }
+    src += body;
 
     from_cache_ = false;
     const std::string cached = opt.cache_dir.empty() ? std::string() : cache_path(opt.cache_dir, src);
