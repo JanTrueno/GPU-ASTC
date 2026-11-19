@@ -1,7 +1,7 @@
 """Runs shaders/astc_encode.comp on desktop OpenGL 4.3 (as #version 430), decodes the
 result with astcenc and reports PSNR. Validates the algorithm and bit packing, not
 GLSL ES compile rules. Needs: moderngl, astc-encoder-py, pillow, numpy."""
-import sys, pathlib, math
+import sys, os, pathlib, math
 import numpy as np
 import moderngl
 from PIL import Image
@@ -9,10 +9,24 @@ import astc_encoder as ae
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-def shader_source(block, alpha, normal=False):
-    body = (ROOT / "shaders/astc_encode.comp").read_text()
-    head = f"#version 430\n#define BLOCK_DIM {block}\n#define HAS_ALPHA {int(alpha)}\n#define IS_NORMALMAP {int(normal)}\n"
+def shader_source(block, alpha, normal=False, premult=False, extra=""):
+    body = pathlib.Path(os.environ.get("GPUASTC_SHADER", ROOT / "shaders/astc_encode.comp")).read_text()
+    head = (f"#version 430\n#define BLOCK_DIM {block}\n#define HAS_ALPHA {int(alpha)}\n#define IS_NORMALMAP {int(normal)}\n"
+            f"#define PREMULTIPLIED {int(premult)}\n{extra}")
     return head + body
+
+_lut = {}
+def bind_lut(ctx, block=4):
+    """partition pattern table for the block size, texture unit 1"""
+    if (ctx, block) not in _lut:
+        import partition_lut
+        if block == 4:
+            tex = ctx.texture((256, 256), 1, partition_lut.lut().tobytes(), dtype="u4")
+        else:
+            tex = ctx.texture((256, 264), 1, partition_lut.big_table(block).tobytes(), dtype="u4")
+        tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        _lut[(ctx, block)] = tex
+    _lut[(ctx, block)].use(1)
 
 def gpu_encode(ctx, rgba, block, alpha):
     h, w, _ = rgba.shape
@@ -21,11 +35,12 @@ def gpu_encode(ctx, rgba, block, alpha):
     tex = ctx.texture((w, h), 4, np.ascontiguousarray(rgba).tobytes())
     tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
     tex.use(0)
+    bind_lut(ctx, block)
     buf = ctx.buffer(reserve=bx * by * 16)
     buf.bind_to_storage_buffer(0)
     prog["uTexSize"].value = (w, h)
     prog["uBlocks"].value = (bx, by)
-    prog["uN"].value = block * block
+    if "uN" in prog: prog["uN"].value = block * block
     prog.run((bx + 7) // 8, (by + 7) // 8, 1)
     ctx.finish()
     return buf.read()

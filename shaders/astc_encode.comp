@@ -5,12 +5,18 @@
 // Derived from niepp/astc_encoder (MIT, Copyright (c) 2021 niedap),
 // ported from HLSL. See THIRD_PARTY_NOTICES.md.
 //
-// One invocation encodes one block: single partition, single plane,
-// 4x4 weight grid, RGB or RGBA direct endpoints (8 bit, unquantized).
+// One invocation encodes one block. Every block size stores one weight per texel:
+//   4x4: 12 weight levels (6 for blocks with alpha)
+//   5x5:  5 weight levels (3 for blocks with alpha)
+//   6x6:  3 weight levels (2 for blocks with alpha)
+// Endpoints are 8 bit. A block of an alpha texture that is in fact opaque is stored as RGB.
+// 4x4 blocks that one colour line fits badly also try two partitions (and, with alpha, two planes).
+// Opaque 5x5 and 6x6 blocks also try a 4x4 grid of 12-level weights, which suits smooth gradients.
 
 precision highp float;
 precision highp int;
 precision highp sampler2D;
+precision highp usampler2D;
 
 #ifndef BLOCK_DIM
 #define BLOCK_DIM 4   // block size: 4, 5 or 6 (4x4, 5x5, 6x6)
@@ -24,84 +30,147 @@ precision highp sampler2D;
 #ifndef IS_NORMALMAP
 #define IS_NORMALMAP 0
 #endif
+#ifndef INPUT_BUFFER
+#define INPUT_BUFFER 0 // 1: the source pixels come from a buffer (one uint per texel), not a texture
+#endif
+#ifndef USE_PARTITIONS
+#define USE_PARTITIONS 1 // 4x4 only; needs the partition table texture (uPartLut)
+#endif
 
 #define DIM BLOCK_DIM
+#define BLOCK_SIZE ((DIM) * (DIM))
 
-// dual-plane encoding is only used for 4x4 blocks with alpha
-#if HAS_ALPHA && BLOCK_DIM == 4
-#define DUAL_PLANE 1
+#if BLOCK_DIM == 4
+#define TWO_PARTITIONS USE_PARTITIONS
+#define DUAL_PLANE HAS_ALPHA
 #else
+#define TWO_PARTITIONS 0
 #define DUAL_PLANE 0
 #endif
 
-#define BLOCK_SIZE ((DIM) * (DIM))
-#define X_GRIDS 4
-#define Y_GRIDS 4
+#ifndef USE_GRID
+#define USE_GRID 1
+#endif
+#if BLOCK_DIM != 4 && !HAS_ALPHA
+#define GRID_MODE USE_GRID
+#else
+#define GRID_MODE 0
+#endif
+// the squared error of the first encoding is only worked out where something is compared with it
+// two partitions for opaque 5x5 / 6x6 blocks; needs the pattern table texture (uPartLut)
+#if BLOCK_DIM != 4 && !HAS_ALPHA
+#define BIG_PARTITIONS USE_PARTITIONS
+#else
+#define BIG_PARTITIONS 0
+#endif
+
+#if BLOCK_DIM == 4 || GRID_MODE || BIG_PARTITIONS
+#define NEED_ERR 1
+#else
+#define NEED_ERR 0
+#endif
+
 #define SMALL_VALUE 0.00001
+
+// Colour type: opaque textures work on RGB only, which keeps more of the block state in registers.
+#if HAS_ALPHA
+#define TV vec4
+#define TV_FROM4(v) (v)
+#else
+#define TV vec3
+#define TV_FROM4(v) (v).rgb
+#endif
+
+// With straight alpha, colour errors count in proportion to the source alpha (the colour under a
+// transparent pixel is invisible); alpha errors count fully. Sums over texels then come in pairs
+// (x: colour channels, y: alpha).
+#if HAS_ALPHA && !PREMULTIPLIED
+#define WEIGHTED 1
+#define S2 vec2
+#define PER_CHANNEL(v) (v).xxxy
+#define SUM2(v) ((v).x + (v).y)
+#define DOT2(a, b) dot(a, b)
+#else
+#define WEIGHTED 0
+#define S2 float
+#define PER_CHANNEL(v) (v)
+#define SUM2(v) (v)
+#define DOT2(a, b) ((a) * (b))
+#endif
 
 #define CEM_LDR_RGB_DIRECT 8u
 #define CEM_LDR_RGBA_DIRECT 12u
 
-#define QUANT_6 4
-#define QUANT_12 7
+// Block modes ("Table C.2.8 - 2D Block Mode Layout"): weight grid size and weight range.
+#define MODE_4x4_Q12 0x251u
+#define MODE_4x4_Q6  0x043u
+#define MODE_4x4_Q3  0x051u
+#define MODE_4x4_Q4  0x042u
+#define MODE_4x4_Q2_DUAL 0x441u
+#define MODE_5x5_Q5  0x0F2u
+#define MODE_5x5_Q3  0x0F1u
+#define MODE_5x5_Q2  0x0E1u
+#define MODE_6x6_Q3  0x114u
+#define MODE_6x6_Q2  0x104u
+
+// Weights are packed in groups of five (trits, or single bits) or three (quints).
+
+// Sum of squared error over a block above which the more expensive encodings are tried.
+#ifndef ALT_ERR_THRESHOLD
+#define ALT_ERR_THRESHOLD 1024.0
+#endif
+// The dual-plane check is cheap next to the partition search and catches "transparent + two
+// colours" blocks whose single-plane error is small in absolute terms, so it starts earlier.
+#ifndef DUAL_ERR_THRESHOLD
+#define DUAL_ERR_THRESHOLD 16.0
+#endif
+// 5x5 / 6x6: the 4x4 weight grid is tried when rounding the weights to their few levels costs
+// more squared error than this. Blocks of hard edges round to the ends of the line for free and
+// skip it.
+#ifndef GRID_ERR_THRESHOLD
+#define GRID_ERR_THRESHOLD 20.0
+#endif
+// ... and only for smooth blocks: the squared weight steps between horizontal neighbours, as a
+// share of the weights' spread. A ramp across the block is about 0.3, noise about 1.7.
+#ifndef GRID_SMOOTH
+#define GRID_SMOOTH 0.4
+#endif
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 uniform ivec2 uTexSize;   // source size in texels
 uniform ivec2 uBlocks;    // size in blocks
 uniform int uN;           // BLOCK_SIZE (non-constant so loops are not unrolled)
+#if INPUT_BUFFER
+// Uploading a texture is slow on some drivers (Mali: 35-40 ms per megapixel, more than encoding
+// it); a buffer is a plain copy. Row-major, R in the low byte.
+layout(std430, binding = 1) readonly buffer InBuffer { uint pixels[]; };
+#else
 layout(binding = 0) uniform highp sampler2D uTex;
+#endif
+#if TWO_PARTITIONS || BIG_PARTITIONS
+// 4x4: 256x256, R32UI: for every 16 bit "which side is each texel on" mask, the closest
+// 2-partition pattern the format offers: seed in bits 0-9, number of texels that differ in bits
+// 10-14, the pattern's own mask in bits 16-31. 5x5 / 6x6: 256x264, see nearest_big().
+layout(binding = 1) uniform highp usampler2D uPartLut;
+#endif
 layout(std430, binding = 0) writeonly buffer OutBuffer { uvec4 blocks[]; };
 
 // ---------------------------------------------------------------------------
-// bit packing (bounded integer sequence encoding), specialised for the fixed modes:
-//   endpoints: 8 bits each (QUANT_256), no trits/quints
-//   weights:   QUANT_12 (2 bits + trit) opaque, QUANT_6 (1 bit + trit) with alpha
-// Everything is pure arithmetic: no lookup tables, so nothing is spilled to memory.
+// bit packing. Everything is pure arithmetic: no lookup tables, so nothing is spilled to memory.
 // ---------------------------------------------------------------------------
 
-#if HAS_ALPHA
-#define WT_BITS 1u
-#define WEIGHT_RANGE 6u
-#else
-#define WT_BITS 2u
-#define WEIGHT_RANGE 12u
-#endif
-
-// Or the low bitcount bits of number into o at bitoffset. number <= 255.
-void orbits8_ptr(inout uvec4 o, inout uint bitoffset, uint number, uint bitcount)
+// Or v into the 128 bit string o at bit pos.
+void put(inout uvec4 o, uint pos, uint v)
 {
-    uint newpos = bitoffset + bitcount;
-    uint uidx = bitoffset >> 5u;
-    uint nidx = newpos >> 5u;
-    uint sh = bitoffset & 31u;
-    uint lo = number << sh;
-    uint hi = (nidx > uidx) ? (number >> ((32u - sh) & 31u)) : 0u;
-    if (uidx == 0u)      { o.x |= lo; o.y |= hi; }
-    else if (uidx == 1u) { o.y |= lo; o.z |= hi; }
-    else if (uidx == 2u) { o.z |= lo; o.w |= hi; }
-    else                 { o.w |= lo; }
-    bitoffset = newpos;
-}
-
-uint reverse_byte(uint p)
-{
-    p = ((p & 0xFu) << 4u) | ((p >> 4u) & 0xFu);
-    p = ((p & 0x33u) << 2u) | ((p >> 2u) & 0x33u);
-    p = ((p & 0x55u) << 1u) | ((p >> 1u) & 0x55u);
-    return p;
-}
-
-// Weight scramble for QUANT_12 / QUANT_6, as packed 4 bit entries.
-uint scramble_weight(uint q)
-{
-#if HAS_ALPHA
-    return (0x135420u >> (q * 4u)) & 15u;                    // {0,2,4,5,3,1}
-#else
-    uint v = (q < 8u) ? (0x7BA62840u >> (q * 4u))            // {0,4,8,2,6,10,11,7,3,9,5,1}
-                      : (0x1593u >> ((q - 8u) * 4u));
-    return v & 15u;
-#endif
+    uint i = pos >> 5u;
+    uint s = pos & 31u;
+    uint lo = v << s;
+    uint hi = (s == 0u) ? 0u : (v >> (32u - s));
+    if (i == 0u)      { o.x |= lo; o.y |= hi; }
+    else if (i == 1u) { o.y |= lo; o.z |= hi; }
+    else if (i == 2u) { o.z |= lo; o.w |= hi; }
+    else              { o.w |= lo; }
 }
 
 // Packs five trits (0..2) into the 8 bit ASTC trit block. Same values as the
@@ -124,257 +193,1087 @@ uint pack_trits(uint t0, uint t1, uint t2, uint t3, uint t4)
                       : (c | (t3 << 5u) | (t4 << 7u));
 }
 
-// One group of five weights: 5 low-bit fields interleaved with the 8 trit bits.
-void encode_trit_group(uint b0, uint b1, uint b2, uint b3, uint b4,
-                       inout uvec4 outputs, inout uint outpos)
+// Packs three quints (0..4) into the 7 bit ASTC quint block (inverse of the spec's decode rules).
+uint pack_quints(uint q0, uint q1, uint q2)
 {
-    const uint mask = (1u << WT_BITS) - 1u;
-    uint packhigh = pack_trits(b0 >> WT_BITS, b1 >> WT_BITS, b2 >> WT_BITS, b3 >> WT_BITS, b4 >> WT_BITS);
-
-    orbits8_ptr(outputs, outpos, b0 & mask, WT_BITS);
-    orbits8_ptr(outputs, outpos, packhigh & 3u, 2u);
-    orbits8_ptr(outputs, outpos, b1 & mask, WT_BITS);
-    orbits8_ptr(outputs, outpos, (packhigh >> 2u) & 3u, 2u);
-    orbits8_ptr(outputs, outpos, b2 & mask, WT_BITS);
-    orbits8_ptr(outputs, outpos, (packhigh >> 4u) & 1u, 1u);
-    orbits8_ptr(outputs, outpos, b3 & mask, WT_BITS);
-    orbits8_ptr(outputs, outpos, (packhigh >> 5u) & 3u, 2u);
-    orbits8_ptr(outputs, outpos, b4 & mask, WT_BITS);
-    orbits8_ptr(outputs, outpos, (packhigh >> 7u) & 1u, 1u);
+    if (q0 == 4u && q1 == 4u)
+        return (q2 == 4u) ? 7u : (6u | ((q2 & 1u) << 3u) | ((q2 >> 1u) << 4u));
+    uint c = (q1 == 4u) ? ((q0 << 3u) | 5u) : ((q1 << 3u) | q0);
+    if (q2 == 4u)
+        return (c & 0x18u) | ((~c & 6u) << 4u) | 6u | (c & 1u);
+    return (q2 << 5u) | c;
 }
 
-// ---------------------------------------------------------------------------
-// endpoints: principal component analysis
-// ---------------------------------------------------------------------------
-
-// Power iteration for the dominant axis. The original used 8 iterations. Starting from the
-// highest-variance covariance column, quality is unchanged down to 1 (measured on photos and
-// sprites; 0 loses ~0.1 dB on photos), which removes about 20% of the arithmetic.
-#define EIGEN_ITERATIONS 1
-vec4 eigen_vector(mat4 m)
+// Bit string of one group of five values (4 bits each in grp: trit above nb low bits):
+// the low-bit fields interleaved with the 8 trit bits. 5 * nb + 8 bits.
+uint trit_group_bits(uint grp, uint nb)
 {
-    // Start from the covariance column with the largest variance. A fixed start vector can be
-    // orthogonal to the real axis (for example a block that only varies in alpha, where a start
-    // vector with alpha = 0 is sent to zero and the block is wrongly treated as flat).
-    vec4 v = m[0];
-    float best = m[0][0];
-    if (m[1][1] > best) { v = m[1]; best = m[1][1]; }
-    if (m[2][2] > best) { v = m[2]; best = m[2][2]; }
-    if (m[3][3] > best) { v = m[3]; best = m[3][3]; }
-    for (int i = 0; i < EIGEN_ITERATIONS; ++i)
+    uint m = (1u << nb) - 1u;
+    uint q0 = grp & 15u, q1 = (grp >> 4u) & 15u, q2 = (grp >> 8u) & 15u, q3 = (grp >> 12u) & 15u, q4 = (grp >> 16u) & 15u;
+    uint t = pack_trits(q0 >> nb, q1 >> nb, q2 >> nb, q3 >> nb, q4 >> nb);
+    uint g = q0 & m;                 uint s = nb;
+    g |= (t & 3u) << s;              s += 2u;
+    g |= (q1 & m) << s;              s += nb;
+    g |= ((t >> 2u) & 3u) << s;      s += 2u;
+    g |= (q2 & m) << s;              s += nb;
+    g |= ((t >> 4u) & 1u) << s;      s += 1u;
+    g |= (q3 & m) << s;              s += nb;
+    g |= ((t >> 5u) & 3u) << s;      s += 2u;
+    g |= (q4 & m) << s;              s += nb;
+    g |= (t >> 7u) << s;
+    return g;
+}
+
+// Weight index (0 = endpoint 0 ... levels-1 = endpoint 1) -> stored value, and -> the weight the
+// decoder uses (0..1). q12 picks between the two 4x4 ranges; 5x5 and 6x6 have one range each.
+#if BLOCK_DIM == 4 || GRID_MODE
+uint scramble_weight(uint q, bool q12)
+{
+    if (q12)
     {
-        v = m * v;
-        if (length(v) < SMALL_VALUE)
-            return v;
-        v = normalize(m * v);
+        uint v = (q < 8u) ? (0x7BA62840u >> (q * 4u))            // {0,4,8,2,6,10,11,7,3,9,5,1}
+                          : (0x1593u >> ((q - 8u) * 4u));
+        return v & 15u;
     }
-    return v;
+    return (0x135420u >> (q * 4u)) & 15u;                        // {0,2,4,5,3,1}
 }
+
+float unquant_weight(uint q, bool q12)
+{
+    uint v;
+    if (q12)
+    {
+        // {0,5,11,17,23,28,36,41,47,53,59,64}
+        v = (((5u << 5u) | (11u << 10u) | (17u << 15u) | (23u << 20u) | (28u << 25u)) >> (min(q, 11u - q) * 5u)) & 31u;
+        if (q > 5u) v = 64u - v;
+    }
+    else
+    {
+        // {0,12,25,39,52,64}
+        v = (((12u << 5u) | (25u << 10u)) >> (min(q, 5u - q) * 5u)) & 31u;
+        if (q > 2u) v = 64u - v;
+    }
+    return float(v) * (1.0 / 64.0);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// texels
+// ---------------------------------------------------------------------------
 
 // Texels are re-fetched from the texture in each pass instead of being kept in
 // registers: a 4x4 block would otherwise need 64 registers just for its pixels.
 ivec2 g_origin; // first texel of this thread's block
+ivec2 g_last;   // last column and row of the block that are inside the image
+#if INPUT_BUFFER
+int g_base;     // index of the first texel
+#endif
 
-vec4 texel(int k)
+// This runs for every texel of every pass, so it avoids a division: Mesa turns a signed one into
+// seven instructions.
+TV texel(int k)
 {
-    int y = k / DIM;
-    int x = k - y * DIM;
-    // replicate edge texels for partial blocks
-    ivec2 p = min(g_origin + ivec2(x, y), uTexSize - ivec2(1));
-    vec4 t = texelFetch(uTex, p, 0);
+#if BLOCK_DIM == 4
+    ivec2 c = ivec2(k & 3, k >> 2);
+#elif BLOCK_DIM == 5
+    int y = (k * 13) >> 6; // k / 5 for k < 25
+    ivec2 c = ivec2(k - 5 * y, y);
+#else
+    int y = (k * 43) >> 8; // k / 6 for k < 36
+    ivec2 c = ivec2(k - 6 * y, y);
+#endif
+    c = min(c, g_last); // replicate edge texels for partial blocks
+#if INPUT_BUFFER
+    uint v = pixels[g_base + c.y * uTexSize.x + c.x];
+#if IS_NORMALMAP
+    v |= 0xFFFF0000u;
+#endif
+    return TV_FROM4(vec4(uvec4(v, v >> 8u, v >> 16u, v >> 24u) & 255u));
+#else
+    vec4 t = texelFetch(uTex, g_origin + c, 0);
 #if IS_NORMALMAP
     t.b = 1.0;
     t.a = 1.0;
 #endif
-    return t * 255.0;
-}
-
-void find_min_max(vec4 pt_mean, vec4 vec_k, out vec4 e0, out vec4 e1)
-{
-    float a = 1e31;
-    float b = -1e31;
-    for (int i = 0; i < uN; ++i)
-    {
-        float t = dot(texel(i) - pt_mean, vec_k);
-        a = min(a, t);
-        b = max(b, t);
-    }
-
-    e0 = clamp(vec_k * a + pt_mean, 0.0, 255.0);
-    e1 = clamp(vec_k * b + pt_mean, 0.0, 255.0);
-
-    // make the first endpoint the darkest one
-    vec4 e0u = round(e0);
-    vec4 e1u = round(e1);
-    if (e0u.x + e0u.y + e0u.z > e1u.x + e1u.y + e1u.z)
-    {
-        vec4 tmp = e0;
-        e0 = e1;
-        e1 = tmp;
-    }
-
-#if !HAS_ALPHA
-    e0.a = 255.0;
-    e1.a = 255.0;
+    return TV_FROM4(t) * 255.0;
 #endif
 }
 
-void principal_component_analysis(out vec4 e0, out vec4 e1, out bool flat_block)
+// Error metric used to choose between encodings. With straight alpha the RGB error counts in
+// proportion to the source alpha (the colour under a transparent pixel is invisible).
+#if DUAL_PLANE
+float pixel_error(vec4 t, vec4 decoded)
 {
-    vec4 pt_mean = vec4(0.0);
-    vec4 tmin = vec4(1e31);
-    vec4 tmax = vec4(-1e31);
-    for (int i = 0; i < uN; ++i)
-    {
-        vec4 t = texel(i);
-        pt_mean += t;
-        tmin = min(tmin, t);
-        tmax = max(tmax, t);
-    }
-    pt_mean /= float(BLOCK_SIZE);
-
-    // Every texel the same colour: skip the covariance, axis and weights (constant-colour block).
-    flat_block = all(equal(tmin, tmax));
-    if (flat_block)
-    {
-        e0 = tmin;
-        e1 = tmin;
-        return;
-    }
-
-    // covariance is symmetric: accumulate the 10 unique entries
-    float c00 = 0.0, c01 = 0.0, c02 = 0.0, c03 = 0.0, c11 = 0.0, c12 = 0.0, c13 = 0.0, c22 = 0.0, c23 = 0.0, c33 = 0.0;
-    for (int k = 0; k < uN; ++k)
-    {
-        vec4 t = texel(k) - pt_mean;
-        c00 += t.x * t.x; c01 += t.x * t.y; c02 += t.x * t.z; c03 += t.x * t.w;
-        c11 += t.y * t.y; c12 += t.y * t.z; c13 += t.y * t.w;
-        c22 += t.z * t.z; c23 += t.z * t.w;
-        c33 += t.w * t.w;
-    }
-    mat4 cov = mat4(c00, c01, c02, c03,
-                    c01, c11, c12, c13,
-                    c02, c12, c22, c23,
-                    c03, c13, c23, c33);
-    cov /= float(BLOCK_SIZE - 1);
-
-    vec4 vec_k = eigen_vector(cov);
-    find_min_max(pt_mean, vec_k, e0, e1);
-}
-
-// ---------------------------------------------------------------------------
-// weights
-// ---------------------------------------------------------------------------
-
-uint quantize_weight(uint weight_range, float weight)
-{
-    uint q = uint(round(max(weight, 0.0) * float(weight_range)));
-    return min(q, weight_range);
-}
-
-// Bilinear tap weight for 6x6 -> 4x4 grid resampling: 0, 1 or 2 "far" taps.
-float tap_weight(int far)
-{
-    return (far == 0) ? 0.444 : ((far == 1) ? 0.222 : 0.111);
-}
-
-// Projection of weight-grid cell i onto the endpoint axis, relative to endpoint 0
-// (k0 = dot(vec_k, ep0)). Each texel is projected to a scalar as soon as it is fetched.
-float weight_proj(int i, vec4 vec_k, float k0)
-{
-#if BLOCK_DIM == 6
-    // bilinear resample of the 6x6 block onto the 4x4 weight grid: cell (gx, gy)
-    // covers texels x0..x0+1, y0..y0+1 with x0, y0 in {0,1,3,4}.
-    int gx = i & 3;
-    int gy = i >> 2;
-    int x0 = gx + (gx >> 1);
-    int y0 = gy + (gy >> 1);
-    int px = gx & 1;  // odd cells: first tap is the far one
-    int py = gy & 1;
-    int base = y0 * 6 + x0;
-    float sum = dot(vec_k, texel(base))     * tap_weight(px + py)
-              + dot(vec_k, texel(base + 1)) * tap_weight((1 - px) + py)
-              + dot(vec_k, texel(base + 6)) * tap_weight(px + (1 - py))
-              + dot(vec_k, texel(base + 7)) * tap_weight((1 - px) + (1 - py));
-#elif BLOCK_DIM == 5
-    // linear resample of the 5x5 block onto the 4x4 weight grid. Grid cell g sits at texel
-    // coordinate g*4/3 (where the decoder's own infill places it): x0 = floor, frac in thirds.
-    int gx = i & 3;
-    int gy = i >> 2;
-    int x0 = min((gx * 4) / 3, 3);
-    int y0 = min((gy * 4) / 3, 3);
-    float fx = float(gx * 4 - 3 * x0) * (1.0 / 3.0);
-    float fy = float(gy * 4 - 3 * y0) * (1.0 / 3.0);
-    int base = y0 * 5 + x0;
-    float sum = dot(vec_k, texel(base))     * ((1.0 - fx) * (1.0 - fy))
-              + dot(vec_k, texel(base + 1)) * (fx * (1.0 - fy))
-              + dot(vec_k, texel(base + 5)) * ((1.0 - fx) * fy)
-              + dot(vec_k, texel(base + 6)) * (fx * fy);
+    vec4 d = t - decoded;
+#if WEIGHTED
+    return (t.a * (1.0 / 255.0)) * dot(d.rgb, d.rgb) + d.a * d.a;
 #else
-    float sum = dot(vec_k, texel(i));
+    return dot(d, d);
 #endif
-    return sum - k0;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// endpoints
+// ---------------------------------------------------------------------------
+
+// Power iteration for the dominant axis of a symmetric covariance matrix, given as its unique
+// entries: xr = (rr, rg, rb), xg = (gg, gb, bb), xa = (ra, ga, ba, aa). The original used 8
+// iterations. Starting from the highest-variance column, quality is unchanged down to 1 (measured
+// on photos and sprites; 0 loses ~0.1 dB on photos), which removes about 20% of the arithmetic.
+// A fixed start vector can be orthogonal to the real axis (for example a block that only varies in
+// alpha, where a start vector with alpha = 0 is sent to zero).
+#define EIGEN_ITERATIONS 1
+vec3 cov_mul(vec3 xr, vec3 xg, vec3 v)
+{
+    return vec3(dot(xr, v), dot(vec3(xr.y, xg.xy), v), dot(vec3(xr.z, xg.yz), v));
 }
 
-// Quantized, scrambled weight for cell i. minw/invlen come from weight_range_pass().
-uint weight_q(int i, vec4 vec_k, float k0, float minw, float invlen)
+vec3 eigen_vector3(vec3 xr, vec3 xg)
 {
-    float w = (weight_proj(i, vec_k, k0) - minw) * invlen;
-    return scramble_weight(quantize_weight(WEIGHT_RANGE - 1u, w));
+    vec3 v = xr;
+    float best = xr.x;
+    if (xg.x > best) { v = vec3(xr.y, xg.xy); best = xg.x; }
+    if (xg.z > best) { v = vec3(xr.z, xg.yz); }
+    for (int i = 0; i < EIGEN_ITERATIONS; ++i)
+    {
+        v = cov_mul(xr, xg, v);
+        if (length(v) < SMALL_VALUE)
+            return v;
+        v = normalize(cov_mul(xr, xg, v));
+    }
+    return v;
+}
+
+#if HAS_ALPHA
+vec4 cov_mul(vec3 xr, vec3 xg, vec4 xa, vec4 v)
+{
+    return vec4(cov_mul(xr, xg, v.rgb) + xa.xyz * v.a, dot(xa, v));
+}
+
+vec4 eigen_vector4(vec3 xr, vec3 xg, vec4 xa)
+{
+    vec4 v = vec4(xr, xa.x);
+    float best = xr.x;
+    if (xg.x > best) { v = vec4(xr.y, xg.xy, xa.y); best = xg.x; }
+    if (xg.z > best) { v = vec4(xr.z, xg.yz, xa.z); best = xg.z; }
+    if (xa.w > best) { v = xa; }
+    for (int i = 0; i < EIGEN_ITERATIONS; ++i)
+    {
+        v = cov_mul(xr, xg, xa, v);
+        if (length(v) < SMALL_VALUE)
+            return v;
+        v = normalize(cov_mul(xr, xg, xa, v));
+    }
+    return v;
+}
+#endif
+
+// Endpoints are stored with 8, 6 or 4 bits per channel; the decoder expands by bit replication.
+TV ep_quant(TV e, int bits)
+{
+    float qmax = (bits == 8) ? 255.0 : ((bits == 6) ? 63.0 : ((bits == 5) ? 31.0 : 15.0));
+    return floor(clamp(e, 0.0, 255.0) * (qmax / 255.0) + 0.5);
+}
+
+TV ep_unquant(TV q, int bits)
+{
+    if (bits == 8) return q;
+    if (bits == 6) return q * 4.0 + floor(q * (1.0 / 16.0));
+    if (bits == 5) return q * 8.0 + floor(q * (1.0 / 4.0));
+    return q * 17.0;
+}
+
+// Quantizes an endpoint pair. The decoder swaps the two (blue contraction) unless the second has
+// the larger RGB sum, so the pair is put in that order. q: stored values, u: what the decoder sees.
+void ep_pair(TV lo, TV hi, int bits, out TV q0, out TV q1, out TV u0, out TV u1)
+{
+    q0 = ep_quant(lo, bits); u0 = ep_unquant(q0, bits);
+    q1 = ep_quant(hi, bits); u1 = ep_unquant(q1, bits);
+    if (u0.r + u0.g + u0.b > u1.r + u1.g + u1.b)
+    {
+        TV t = q0; q0 = q1; q1 = t;
+        t = u0; u0 = u1; u1 = t;
+    }
+}
+
+// Least-squares endpoints for one group of texels whose weights are chosen, from sums over the
+// group: nn = sum(om), sw = sum(om*w), sww = sum(om*w*w), swt = sum(om*w*t), st = sum(om*t),
+// where om is 1, or with straight alpha the weight of the texel's colour / alpha error.
+// The pair is replaced when the system is solvable and the result keeps its order.
+void refit(S2 nn, S2 sw, S2 sww, TV swt, TV st, int bits, inout TV q0, inout TV q1)
+{
+    S2 al = nn - 2.0 * sw + sww;
+    S2 be = sw - sww;
+    S2 det = al * sww - be * be;
+#if WEIGHTED
+    if (det.x < 0.01 || det.y < 0.01)
+        return;
+#else
+    if (det < 0.01)
+        return;
+#endif
+    TV a = st - swt;
+    TV r0 = ep_quant((PER_CHANNEL(sww) * a - PER_CHANNEL(be) * swt) / PER_CHANNEL(det), bits);
+    TV r1 = ep_quant((PER_CHANNEL(al) * swt - PER_CHANNEL(be) * a) / PER_CHANNEL(det), bits);
+    a = ep_unquant(r1, bits) - ep_unquant(r0, bits);
+    if (a.r + a.g + a.b >= 0.0)
+    {
+        q0 = r0;
+        q1 = r1;
+    }
+}
+
+// Squared error of a group stored with the pair q0, q1: sum(om * (t - u0 - w*(u1-u0))^2), expanded
+// into the sums above and sqq = sum(om*t*t).
+float group_error(S2 nn, S2 sw, S2 sww, TV swt, TV st, float sqq, int bits, TV q0, TV q1)
+{
+    TV u = ep_unquant(q0, bits);
+    TV d = ep_unquant(q1, bits) - u;
+    return sqq + dot(u, u * PER_CHANNEL(nn) - 2.0 * st + 2.0 * d * PER_CHANNEL(sw)) + dot(d, d * PER_CHANNEL(sww) - 2.0 * swt);
+}
+
+// Writes an endpoint pair as r0 r1 g0 g1 b0 b1 [a0 a1].
+void put_endpoints(inout uvec4 blk, inout uint pos, TV q0, TV q1, int bits, bool rgba)
+{
+#if HAS_ALPHA
+    uvec4 a = uvec4(q0);
+    uvec4 b = uvec4(q1);
+#else
+    uvec3 a = uvec3(q0);
+    uvec3 b = uvec3(q1);
+#endif
+    uint n = uint(bits);
+    put(blk, pos, a.r | (b.r << n)); pos += 2u * n;
+    put(blk, pos, a.g | (b.g << n)); pos += 2u * n;
+    put(blk, pos, a.b | (b.b << n)); pos += 2u * n;
+#if HAS_ALPHA
+    if (rgba)
+    {
+        put(blk, pos, a.a | (b.a << n)); pos += 2u * n;
+    }
+#endif
+}
+
+// Weights are stored bit-reversed from the end of the block. No mode here has more than 64 bits.
+void put_weights(inout uvec4 blk, uvec2 ws)
+{
+    blk.w |= bitfieldReverse(ws.x);
+    blk.z |= bitfieldReverse(ws.y);
+}
+
+// Or v into the 64 bit string o at bit pos.
+void put2(inout uvec2 o, uint pos, uint v)
+{
+    uint s = pos & 31u;
+    if (pos < 32u)
+    {
+        o.x |= v << s;
+        if (s != 0u) o.y |= v >> (32u - s);
+    }
+    else
+    {
+        o.y |= v << s;
+    }
 }
 
 // ---------------------------------------------------------------------------
-// block assembly
+// one partition, one plane: three passes over the block
+//   1. mean, covariance, flat test          -> main axis
+//   2. extent of the texels along the axis  -> endpoints
+//   3. weights against the stored endpoints -> bits, least-squares sums
+// then the endpoints are moved along their line to the least-squares positions for the weights
+// that were chosen. Only sums of scalars are carried through pass 3: every value that stays alive
+// in that loop costs registers, and past 32 a Mali Bifrost core runs half as many threads.
+// Returns the stored endpoints (e0, e1), the squared error and the texel farthest off the line.
 // ---------------------------------------------------------------------------
 
-uvec4 assemble_block(uint blockmode, uint color_endpoint_mode, uvec4 ep_ise, uvec4 wt_ise)
+uvec4 encode_block(out float err, out float round_err, out bool opaque, out TV e0, out TV e1, out int far)
 {
+    // pass 1. Moments are taken relative to the first texel: sums of products of raw 0..255
+    // values would lose the low bits that the covariance of a smooth block lives in.
+    TV ref = texel(0);
+    TV s = TV(0.0);
+    vec3 xr = vec3(0.0); // r*r, r*g, r*b
+    vec3 xg = vec3(0.0); // g*g, g*b, b*b
+#if HAS_ALPHA
+    vec4 xa = vec4(0.0); // a*(r, g, b, a)
+    float amin = 0.0;
+#endif
+    for (int i = 1; i < uN; ++i)
+    {
+        TV c = texel(i) - ref;
+        s += c;
+        xr += c.r * c.rgb;
+        xg += vec3(c.g * c.gb, c.b * c.b);
+#if HAS_ALPHA
+        xa += c.a * c;
+        amin = min(amin, c.a);
+#endif
+    }
+
+    err = 0.0;
+    round_err = 0.0;
+    far = 0;
+    e0 = ref;
+    e1 = ref;
+#if HAS_ALPHA
+    opaque = ref.a + amin > 254.5;
+    float sqc = xr.x + xg.x + xg.z + xa.w; // sum of squared distances to the first texel
+#else
+    opaque = true;
+    float sqc = xr.x + xg.x + xg.z;
+#endif
+
+    // Every texel the same colour: constant-colour (void-extent) block. No axis, weights or
+    // bit packing needed, and it is exact. 8 bit -> 16 bit UNORM is a multiply by 257.
+    if (sqc == 0.0)
+    {
+#if HAS_ALPHA
+        uvec4 c = uvec4(round(ref)) * 257u;
+#else
+        uvec4 c = uvec4(uvec3(round(ref)) * 257u, 65535u);
+#endif
+        return uvec4(0xFFFFFDFCu, 0xFFFFFFFFu, c.r | (c.g << 16u), c.b | (c.a << 16u));
+    }
+
+    const float n = float(BLOCK_SIZE);
+    TV mc = s * (1.0 / n);
+    TV mean = ref + mc;
+    xr -= s.r * mc.rgb;
+    xg -= vec3(s.g * mc.gb, s.b * mc.b);
+#if HAS_ALPHA
+    xa -= s.a * mc;
+    TV axis = eigen_vector4(xr, xg, xa);
+#else
+    TV axis = eigen_vector3(xr, xg);
+#endif
+
+    // pass 2
+    float lo = 1e31;
+    float hi = -1e31;
+    for (int i = 0; i < uN; ++i)
+    {
+        float p = dot(texel(i) - mean, axis);
+        lo = min(lo, p);
+        hi = max(hi, p);
+    }
+
+    // Storage: alpha blocks that are in fact opaque are stored as RGB, which frees bits.
+    const int ebits = 8;
+#if BLOCK_DIM == 4
+    bool q12 = opaque;
+    float wmax = q12 ? 11.0 : 5.0;
+    uint nb = q12 ? 2u : 1u;
+    uint mode = q12 ? MODE_4x4_Q12 : MODE_4x4_Q6;
+    const uint group4 = 20u; // 4 * weights per group
+#elif BLOCK_DIM == 5
+    float wmax = opaque ? 4.0 : 2.0;
+    uint mode = opaque ? MODE_5x5_Q5 : MODE_5x5_Q3;
+    uint group4 = opaque ? 12u : 20u;
+#else
+    float wmax = opaque ? 2.0 : 1.0;
+    uint mode = opaque ? MODE_6x6_Q3 : MODE_6x6_Q2;
+    const uint group4 = 20u;
+#endif
+
+    {
+        TV q0, q1;
+        ep_pair(mean + axis * lo, mean + axis * hi, ebits, q0, q1, e0, e1);
+    }
+    TV d = e1 - e0;
+#if WEIGHTED
+    vec2 dd = vec2(dot(d.rgb, d.rgb), d.a * d.a);
+#else
+    float dd = dot(d, d);
+#endif
+    float inv = 1.0 / max(SUM2(dd), SMALL_VALUE);
+
+    // pass 3. With c = t - e0 and p = c.d, per texel: sw = sum(w), sww = sum(w*w), sp = sum(p),
+    // swp = sum(w*p), scc = sum(c.c). With straight alpha each is a pair (colour, alpha) and the
+    // colour part is weighted by the texel's alpha.
+    uvec2 ws = uvec2(0u);
+    S2 sw = S2(0.0);
+    S2 sww = S2(0.0);
+    S2 sp = S2(0.0);
+    S2 swp = S2(0.0);
+#if NEED_ERR
+    S2 scc = S2(0.0);
+    float worst = -1.0;
+#endif
+#if GRID_MODE
+    float wprev = 0.0, rough = 0.0, siw = 0.0, siww = 0.0; // previous weight, sum of squared steps, sums of w and w*w
+    int col = 0;
+#endif
+#if WEIGHTED
+    vec2 nn = vec2(0.0, n);
+#else
+    const float nn = n;
+#endif
+    uint grp = 0u;  // the weights of the group being filled, 4 bits each
+    uint gsh = 0u;  // 4 * weights in grp
+    uint wpos = 0u; // bits written to ws
+    for (int i = 0; i < uN; ++i)
+    {
+        {
+            TV c = texel(i) - e0;
+#if WEIGHTED
+            vec2 om = vec2((c.a + e0.a) * (1.0 / 255.0), 1.0);
+            vec2 pc = om * vec2(dot(c.rgb, d.rgb), c.a * d.a);
+            nn.x += om.x;
+#else
+            const float om = 1.0;
+            float pc = dot(c, d);
+#endif
+#if WEIGHTED
+            // least-squares weight under the same per-channel weights (a transparent texel is
+            // placed by its alpha alone)
+            float w = clamp(SUM2(pc) / max(dot(om, dd), SMALL_VALUE), 0.0, 1.0);
+#else
+            float w = clamp(pc * inv, 0.0, 1.0);
+#endif
+            uint q = uint(w * wmax + 0.5);
+#if BLOCK_DIM == 4
+            float wu = unquant_weight(q, q12);
+            q = scramble_weight(q, q12);
+#else
+            float wu = float(q) * (1.0 / wmax);
+#endif
+#if GRID_MODE
+            round_err += (w - wu) * (w - wu);
+            if (col != 0) rough += (w - wprev) * (w - wprev);
+            col = (col == DIM - 1) ? 0 : col + 1;
+            wprev = w;
+            siw += w;
+            siww += w * w;
+#endif
+            sw += wu * om;
+            sww += wu * wu * om;
+            sp += pc;
+            swp += wu * pc;
+#if NEED_ERR
+#if WEIGHTED
+            vec2 cc = om * vec2(dot(c.rgb, c.rgb), c.a * c.a);
+#else
+            float cc = dot(c, c);
+#endif
+            scc += cc;
+#if TWO_PARTITIONS || BIG_PARTITIONS
+            // squared distance from the line (not the segment): the third colour of the block
+#if WEIGHTED
+            float cd = dot(c, d);
+            float off = dot(c, c) - cd * cd / max(dot(d, d), SMALL_VALUE);
+#else
+            float off = cc - pc * pc * inv;
+#endif
+            if (off > worst) { worst = off; far = i; }
+#endif
+#endif
+            grp |= q << gsh;
+            gsh += 4u;
+        }
+        // group full, or last texel: pack it
+        if (gsh == group4 || i == uN - 1)
+        {
+#if BLOCK_DIM == 5
+            if (opaque) { put2(ws, wpos, pack_quints(grp & 15u, (grp >> 4u) & 15u, (grp >> 8u) & 15u)); wpos += 7u; }
+            else        { put2(ws, wpos, trit_group_bits(grp, 0u)); wpos += 8u; }
+#elif BLOCK_DIM == 6
+            if (opaque) { put2(ws, wpos, trit_group_bits(grp, 0u)); wpos += 8u; }
+            else        { put2(ws, wpos, (grp & 1u) | ((grp >> 3u) & 2u) | ((grp >> 6u) & 4u) | ((grp >> 9u) & 8u) | ((grp >> 12u) & 16u)); wpos += 5u; }
+#else
+            put2(ws, wpos, trit_group_bits(grp, nb));
+            wpos += 5u * nb + 8u;
+#endif
+            grp = 0u;
+            gsh = 0u;
+        }
+    }
+
+    // Refit: the texel with weight w is decoded as e0 + (a + (b - a) * w) * d; a = 0, b = 1 are the
+    // endpoints as they are. Least squares for a and b (2x2 system), then the error for them.
+    float al = DOT2(dd, nn - 2.0 * sw + sww);
+    float be = DOT2(dd, sw - sww);
+    float ga = DOT2(dd, sww);
+    float r1 = SUM2(swp);
+    float r0 = SUM2(sp) - r1;
+    float det = al * ga - be * be;
+    float a = 0.0;
+    float b = 1.0;
+    if (det > 1e-4 * (al + ga) * (al + ga))
+    {
+        a = (ga * r0 - be * r1) / det;
+        b = (al * r1 - be * r0) / det;
+        // 8 bit endpoints: the stored values are the decoded ones
+        TV n0 = ep_quant(e0 + a * d, ebits);
+        TV n1 = ep_quant(e0 + b * d, ebits);
+        TV dn = n1 - n0;
+        if (dn.r + dn.g + dn.b >= 0.0)
+        {
+            e0 = n0;
+            e1 = n1;
+        }
+        else
+        {
+            a = 0.0;
+            b = 1.0;
+        }
+    }
+#if NEED_ERR
+    err = SUM2(scc) - 2.0 * (a * r0 + b * r1) + a * a * al + 2.0 * a * b * be + b * b * ga;
+#endif
+#if GRID_MODE
+    // not smooth: the grid cannot follow it, do not try
+    round_err = (rough > GRID_SMOOTH * (siww - siw * siw / n)) ? 0.0 : round_err * dd;
+#endif
+
     uvec4 blk = uvec4(0u);
-
-    // weights are stored bit-reversed from the end of the block
-    blk.w |= reverse_byte(wt_ise.x & 0xFFu) << 24u;
-    blk.w |= reverse_byte((wt_ise.x >> 8u) & 0xFFu) << 16u;
-    blk.w |= reverse_byte((wt_ise.x >> 16u) & 0xFFu) << 8u;
-    blk.w |= reverse_byte((wt_ise.x >> 24u) & 0xFFu);
-
-    blk.z |= reverse_byte(wt_ise.y & 0xFFu) << 24u;
-    blk.z |= reverse_byte((wt_ise.y >> 8u) & 0xFFu) << 16u;
-    blk.z |= reverse_byte((wt_ise.y >> 16u) & 0xFFu) << 8u;
-    blk.z |= reverse_byte((wt_ise.y >> 24u) & 0xFFu);
-
-    blk.y |= reverse_byte(wt_ise.z & 0xFFu) << 24u;
-    blk.y |= reverse_byte((wt_ise.z >> 8u) & 0xFFu) << 16u;
-    blk.y |= reverse_byte((wt_ise.z >> 16u) & 0xFFu) << 8u;
-    blk.y |= reverse_byte((wt_ise.z >> 24u) & 0xFFu);
-
-    blk.x = blockmode;                          // 11 bits
-    blk.x |= (color_endpoint_mode & 0xFu) << 13u; // 4 bits, single partition
-
-    // endpoints start at bit 17 for a single partition
-    blk.x |= (ep_ise.x & 0x7FFFu) << 17u;
-    blk.y |= (ep_ise.x >> 15u) & 0x1FFFFu;
-    blk.y |= (ep_ise.y & 0x7FFFu) << 17u;
-    blk.z |= (ep_ise.y >> 15u) & 0x1FFFFu;
+    // A choice between two literals goes into a variable before it is shifted: Arm's old
+    // Mali-T860 compiler (r18) otherwise works it out in 16 bits and the top bit is lost.
+    uint cem = opaque ? CEM_LDR_RGB_DIRECT : CEM_LDR_RGBA_DIRECT;
+    blk.x = mode | (cem << 13u);
+    uint pos = 17u;
+    put_endpoints(blk, pos, e0, e1, ebits, !opaque);
+    put_weights(blk, ws);
     return blk;
 }
 
-// "Table C.2.8 - 2D Block Mode Layout", first row.
-uint assemble_blockmode(uint weight_quantmethod)
-{
-    uint a = uint(Y_GRIDS - 2) & 3u;
-    uint b = uint(X_GRIDS - 4) & 3u;
-    uint d = 0u; // dual plane
-    uint h = (weight_quantmethod < 6u) ? 0u : 1u;
-    uint r = (weight_quantmethod % 6u) + 2u;
+// ---------------------------------------------------------------------------
+// 4x4 weight grid for 5x5 and 6x6 blocks (opaque only)
+//
+// One weight per texel leaves 5x5 with 5 weight levels and 6x6 with 3. A block that is one smooth
+// gradient is better served by 16 weights of 12 levels that the decoder interpolates across the
+// block. Two passes: the grid weights, then the texels as the decoder will rebuild them, which
+// gives the refit sums and the error that decides between the two encodings.
+// ---------------------------------------------------------------------------
 
-    uint blockmode = (r >> 1u) & 3u;
-    blockmode |= (r & 1u) << 4u;
-    blockmode |= a << 5u;
-    blockmode |= b << 7u;
-    blockmode |= h << 9u;
-    blockmode |= d << 10u;
-    return blockmode;
+#if GRID_MODE
+// Where the four grid cells of a row (or column) sit, in texel coordinates. A texel's projection
+// counts for a cell by 1 - distance (never for more than two cells per axis).
+#if BLOCK_DIM == 6
+const vec4 GRID_CELL = vec4(1.0 / 3.0, 5.0 / 3.0, 10.0 / 3.0, 14.0 / 3.0);
+#else
+const vec4 GRID_CELL = vec4(0.0, 4.0 / 3.0, 8.0 / 3.0, 4.0);
+#endif
+
+// One row of wanted grid weights -> stored indices (4 bits each) and decoder values (a byte each).
+void grid_row(vec4 w, out uint q4, out uint u8)
+{
+    uvec4 q = uvec4(clamp(w, 0.0, 1.0) * 11.0 + 0.5);
+    q4 = q.x | (q.y << 4u) | (q.z << 8u) | (q.w << 12u);
+    u8 = uint(unquant_weight(q.x, true) * 64.0 + 0.5) | (uint(unquant_weight(q.y, true) * 64.0 + 0.5) << 8u)
+       | (uint(unquant_weight(q.z, true) * 64.0 + 0.5) << 16u) | (uint(unquant_weight(q.w, true) * 64.0 + 0.5) << 24u);
 }
+
+// best: the error to beat; the block is only packed (and true returned) when the grid is better.
+bool encode_grid(TV e0, TV e1, inout float best, out uvec4 blk)
+{
+    TV d = e1 - e0;
+    float dd = dot(d, d);
+    float inv = 1.0 / max(dd, SMALL_VALUE);
+
+    // pass 1: the 16 wanted grid weights. Every texel is read once; its projection onto the
+    // endpoint line is spread over the cells of its row, and each finished row over the grid rows.
+    TV dn = d * inv;
+    vec4 a0 = vec4(0.0), a1 = vec4(0.0), a2 = vec4(0.0), a3 = vec4(0.0);
+    int i = 0;
+    for (int gy = 0; i < uN; ++gy) // an int counter: PowerVR's compiler (1.19) gets a float one wrong here
+    {
+        vec4 row = vec4(0.0);
+        for (int col = 0; col < DIM; ++col, ++i)
+            row += max(1.0 - abs(float(col) - GRID_CELL), 0.0) * dot(dn, texel(i) - e0);
+        vec4 wy = max(1.0 - abs(float(gy) - GRID_CELL), 0.0);
+        a0 += wy.x * row;
+        a1 += wy.y * row;
+        a2 += wy.z * row;
+        a3 += wy.w * row;
+    }
+    // gq: the stored index, 4 bits each; gu: the decoder's value (0..64), one byte each, one row
+    // per component
+    uvec2 gq;
+    uvec4 gu;
+    {
+        uint qa, qb;
+        grid_row(a0, qa, gu.x);
+        grid_row(a1, qb, gu.y);
+        gq.x = qa | (qb << 16u);
+        grid_row(a2, qa, gu.z);
+        grid_row(a3, qb, gu.w);
+        gq.y = qa | (qb << 16u);
+    }
+
+    // pass 2: every texel with the weight the decoder interpolates for it (ASTC weight infill)
+    float sw = 0.0, sww = 0.0, sp = 0.0, swp = 0.0, scc = 0.0;
+    // position in the grid in 1/16 cells: scale = (1024 + DIM / 2) / (DIM - 1), 3 = grid size - 1
+    const int scale = 3 * ((1024 + DIM / 2) / (DIM - 1));
+    i = 0;
+    for (int y = 0; i < uN; ++y)
+    {
+        int gy = (y * scale + 32) >> 6;
+        uint fy = uint(gy & 15);
+        // the two grid rows around this texel row. Past the last row or column the fraction is
+        // 0, so what is read there does not count.
+        uint row0 = gu[gy >> 4];
+        uint row1 = gu[((gy >> 4) + 1) & 3];
+        for (int x = 0; x < DIM; ++x, ++i)
+        {
+            int gx = (x * scale + 32) >> 6;
+            uint fx = uint(gx & 15);
+            // shifted so the low two bytes are the weights left and right of the texel
+            uint r0 = row0 >> uint(8 * (gx >> 4));
+            uint r1 = row1 >> uint(8 * (gx >> 4));
+            uint w11 = (fx * fy + 8u) >> 4u;
+            uint wi = (r0 & 255u) * (16u - fx - fy + w11) + ((r0 >> 8u) & 255u) * (fx - w11)
+                    + (r1 & 255u) * (fy - w11) + ((r1 >> 8u) & 255u) * w11;
+            float wu = float((wi + 8u) >> 4u) * (1.0 / 64.0);
+            TV c = texel(i) - e0;
+            float pc = dot(c, d);
+            sw += wu;
+            sww += wu * wu;
+            sp += pc;
+            swp += wu * pc;
+            scc += dot(c, c);
+        }
+    }
+
+    // refit along the line and error, as in encode_block
+    float n = float(BLOCK_SIZE);
+    float al = dd * (n - 2.0 * sw + sww);
+    float be = dd * (sw - sww);
+    float ga = dd * sww;
+    float r0 = sp - swp;
+    float det = al * ga - be * be;
+    float a = 0.0;
+    float b = 1.0;
+    if (det > 1e-4 * (al + ga) * (al + ga))
+    {
+        a = (ga * r0 - be * swp) / det;
+        b = (al * swp - be * r0) / det;
+        TV n0 = ep_quant(e0 + a * d, 8);
+        TV n1 = ep_quant(e0 + b * d, 8);
+        TV dn = n1 - n0;
+        if (dn.r + dn.g + dn.b >= 0.0)
+        {
+            e0 = n0;
+            e1 = n1;
+        }
+        else
+        {
+            a = 0.0;
+            b = 1.0;
+        }
+    }
+    float err = scc - 2.0 * (a * r0 + b * swp) + a * a * al + 2.0 * a * b * be + b * b * ga;
+    if (err >= best)
+        return false; // skip the packing
+    best = err;
+
+    uvec2 ws = uvec2(0u);
+    for (int g = 0; g < 4; ++g)
+    {
+        uint grp = 0u;
+        for (int m = 0; m < 5; ++m)
+        {
+            int i = g * 5 + m;
+            if (i >= 16)
+                break;
+            uint q = (((i < 8) ? gq.x : gq.y) >> uint(4 * (i & 7))) & 15u;
+            grp |= scramble_weight(q, true) << uint(4 * m);
+        }
+        put2(ws, uint(g) * 18u, trit_group_bits(grp, 2u));
+    }
+    blk = uvec4(0u);
+    blk.x = MODE_4x4_Q12 | (CEM_LDR_RGB_DIRECT << 13u);
+    uint pos = 17u;
+    put_endpoints(blk, pos, e0, e1, 8, false);
+    put_weights(blk, ws);
+    return true;
+}
+#endif
+
+#if TWO_PARTITIONS || BIG_PARTITIONS
+// Endpoints of one group: opposite corners of its bounding box. Which corner each channel starts
+// from follows the sign of its covariance with the widest channel. Exact for two colours.
+// e0: the first endpoint as decoded, d: the step to the second.
+#if HAS_ALPHA
+void box_pair(TV mn, TV mx, TV s, float cnt, vec3 xr, vec3 xg, int ebits, out TV e0, out TV d)
+#else
+void box_pair(TV mn, TV mx, TV s, float cnt, vec3 xr, int ebits, out TV e0, out TV d)
+#endif
+{
+    TV m = s / max(cnt, 1.0);
+    TV rng = mx - mn;
+    TV sg;
+#if HAS_ALPHA
+    xr -= s.r * m.gba;
+    xg -= vec3(s.g * m.ba, s.b * m.a);
+    if (rng.r >= rng.g && rng.r >= rng.b && rng.r >= rng.a) sg = vec4(1.0, xr.x, xr.y, xr.z);
+    else if (rng.g >= rng.b && rng.g >= rng.a)              sg = vec4(xr.x, 1.0, xg.x, xg.y);
+    else if (rng.b >= rng.a)                                sg = vec4(xr.y, xg.x, 1.0, xg.z);
+    else                                                    sg = vec4(xr.z, xg.y, xg.z, 1.0);
+    bvec4 up = greaterThanEqual(sg, vec4(0.0));
+#else
+    xr -= vec3(s.r * m.gb, s.g * m.b);
+    if (rng.r >= rng.g && rng.r >= rng.b) sg = vec3(1.0, xr.x, xr.y);
+    else if (rng.g >= rng.b)              sg = vec3(xr.x, 1.0, xr.z);
+    else                                  sg = vec3(xr.y, xr.z, 1.0);
+    bvec3 up = greaterThanEqual(sg, vec3(0.0));
+#endif
+    TV q0, q1;
+    ep_pair(mix(mx, mn, up), mix(mn, mx, up), ebits, q0, q1, e0, d);
+    d -= e0;
+}
+
+#endif
+
+// ---------------------------------------------------------------------------
+// two partitions for opaque 5x5 and 6x6 blocks
+//
+// Storage: 6 bit (5x5) or 5 bit (6x6) RGB endpoints and one weight bit per texel, so each group
+// is drawn with two colours. That suits what a single line with 3 to 5 weight levels does worst:
+// hard edges between flat areas (sprites, text, UI).
+// Masks hold rows 0-2 in .x and the remaining rows in .y, DIM bits per row.
+// ---------------------------------------------------------------------------
+
+#if BIG_PARTITIONS
+#ifndef BIG_ERR_THRESHOLD
+#define BIG_ERR_THRESHOLD 512.0 // squared error per texel above which the split is tried
+// (512: the blocks with hard edges that gain most; lower values add smaller gains on photos for
+// a lot more time)
+#endif
+#ifndef BIG_CANDIDATES
+#define BIG_CANDIDATES 2
+#endif
+#ifndef BIG_MAX_MISMATCH
+#define BIG_MAX_MISMATCH 3 // skip a split when the closest pattern differs in more texels than this
+#endif
+
+// Four of a row's texels: columns 0,1,3,4 (5x5) or 0,2,3,5 (6x6).
+uint sample4(uint r)
+{
+#if BLOCK_DIM == 5
+    return (r & 3u) | ((r >> 1u) & 12u);
+#else
+    return (r & 1u) | ((r >> 1u) & 6u) | ((r >> 2u) & 8u);
+#endif
+}
+
+// The pattern table. Rows 0-255: by a 16-texel sample of the wanted split (rows 0,1,3,4 or
+// 0,2,3,5 with sample4), the seeds of the three patterns closest on that sample, 10 bits each.
+// Rows 256-263: the two mask words of every seed. Returns the number of texels in which the
+// closest of the three differs from the wanted split m (either labelling).
+uint nearest_big(uvec2 m, out uint seed, out uvec2 pm)
+{
+#if BLOCK_DIM == 5
+    uint key = sample4(m.x) | (sample4(m.x >> 5u) << 4u) | (sample4(m.y) << 8u) | (sample4(m.y >> 5u) << 12u);
+#else
+    uint key = sample4(m.x) | (sample4(m.x >> 12u) << 4u) | (sample4(m.y) << 8u) | (sample4(m.y >> 12u) << 12u);
+#endif
+    uint e = texelFetch(uPartLut, ivec2(int(key & 255u), int(key >> 8u)), 0).r;
+    uint best = 99u;
+    seed = 0u;
+    pm = uvec2(0u);
+    for (int c = 0; c < 3; ++c)
+    {
+        uint sd = (e >> uint(10 * c)) & 1023u;
+        ivec2 at = ivec2(int((sd * 2u) & 255u), 256 + int(sd >> 7u));
+        uvec2 p = uvec2(texelFetch(uPartLut, at, 0).r, texelFetch(uPartLut, at + ivec2(1, 0), 0).r);
+        uint mm = uint(bitCount(p.x ^ m.x) + bitCount(p.y ^ m.y));
+        mm = min(mm, uint(BLOCK_SIZE) - mm);
+        if (mm < best)
+        {
+            best = mm;
+            seed = sd;
+            pm = p;
+        }
+    }
+    return best;
+}
+
+// One group whose texels each take one of two colours: the colours are the means of the two
+// sets (f0, f1 when a set is empty). n, s: count and colour sum of each set, qq: sum of t.t over
+// the group. Returns the squared error; flip: the pair had to be swapped to stay in stored order.
+float two_colours(float n0, vec3 s0, float n1, vec3 s1, float qq, vec3 f0, vec3 f1, int bits,
+                  out vec3 q0, out vec3 q1, out bool flip)
+{
+    q0 = ep_quant((n0 > 0.5) ? s0 / n0 : f0, bits);
+    q1 = ep_quant((n1 > 0.5) ? s1 / n1 : f1, bits);
+    vec3 u0 = ep_unquant(q0, bits);
+    vec3 u1 = ep_unquant(q1, bits);
+    float e = qq + dot(u0, n0 * u0 - 2.0 * s0) + dot(u1, n1 * u1 - 2.0 * s1);
+    flip = u0.r + u0.g + u0.b > u1.r + u1.g + u1.b;
+    if (flip)
+    {
+        vec3 t = q0; q0 = q1; q1 = t;
+    }
+    return e;
+}
+
+// best: the error to beat; the block is only packed (and true returned) when the split is better.
+bool encode_two_partitions_big(uint seed, uvec2 pm, inout float best, out uvec4 blk)
+{
+    const int ebits = (BLOCK_DIM == 5) ? 6 : 5;
+
+    // pass 1: bounding box, sums and covariance signs of both groups
+    vec3 mn0 = vec3(255.0), mx0 = vec3(0.0), mn1 = vec3(255.0), mx1 = vec3(0.0);
+    vec3 sa = vec3(0.0), s1 = vec3(0.0);
+    vec3 xra = vec3(0.0), xr1 = vec3(0.0); // r*g, r*b, g*b
+    float cnt1 = 0.0;
+    int i = 0;
+    for (int y = 0; i < uN; ++y)
+    {
+        uint rb = ((y < 3) ? pm.x : pm.y) >> uint(DIM * ((y < 3) ? y : y - 3));
+        for (int x = 0; x < DIM; ++x, ++i)
+        {
+            vec3 t = texel(i);
+            bool g = ((rb >> uint(x)) & 1u) != 0u;
+            float gf = float(g);
+            vec3 lo = min(g ? mn1 : mn0, t);
+            vec3 hi = max(g ? mx1 : mx0, t);
+            mn0 = g ? mn0 : lo; mn1 = g ? lo : mn1;
+            mx0 = g ? mx0 : hi; mx1 = g ? hi : mx1;
+            sa += t;
+            s1 += gf * t;
+            cnt1 += gf;
+            vec3 pr = vec3(t.r * t.gb, t.g * t.b);
+            xra += pr;
+            xr1 += gf * pr;
+        }
+    }
+    float cnt0 = float(BLOCK_SIZE) - cnt1;
+    vec3 e0, d0, e1, d1; // group 0 and group 1: first colour, step to the second
+    box_pair(mn0, mx0, sa - s1, cnt0, xra - xr1, ebits, e0, d0);
+    box_pair(mn1, mx1, s1, cnt1, xr1, ebits, e1, d1);
+    vec2 inv = 1.0 / max(vec2(dot(d0, d0), dot(d1, d1)), vec2(SMALL_VALUE));
+
+    // pass 2: every texel takes the nearer colour of its group. Sums over the texels with
+    // weight 1 (w), over those of group 1 with weight 1 (gw), and of t.t.
+    uvec2 ws = uvec2(0u);
+    vec3 sw = vec3(0.0), sgw = vec3(0.0);
+    float nw = 0.0, ngw = 0.0, qa = 0.0, qg = 0.0;
+    i = 0;
+    for (int y = 0; i < uN; ++y)
+    {
+        uint rb = ((y < 3) ? pm.x : pm.y) >> uint(DIM * ((y < 3) ? y : y - 3));
+        uint rw = 0u;
+        for (int x = 0; x < DIM; ++x, ++i)
+        {
+            vec3 t = texel(i);
+            bool g = ((rb >> uint(x)) & 1u) != 0u;
+            float gf = float(g);
+            bool w = dot(t - (g ? e1 : e0), g ? d1 : d0) * (g ? inv.y : inv.x) > 0.5;
+            float wf = float(w);
+            float tt = dot(t, t);
+            rw |= uint(w) << uint(x);
+            sw += wf * t;
+            sgw += (gf * wf) * t;
+            nw += wf;
+            ngw += gf * wf;
+            qa += tt;
+            qg += gf * tt;
+        }
+        put2(ws, uint(DIM * y), rw);
+    }
+
+    vec3 q0, q1, q2, q3;
+    bool flip0, flip1;
+    float err = two_colours(cnt0 - (nw - ngw), (sa - s1) - (sw - sgw), nw - ngw, sw - sgw, qa - qg,
+                            e0, e0 + d0, ebits, q0, q1, flip0)
+              + two_colours(cnt1 - ngw, s1 - sgw, ngw, sgw, qg, e1, e1 + d1, ebits, q2, q3, flip1);
+    if (err >= best)
+        return false; // most splits lose: skip the packing
+    best = err;
+
+    // a swapped pair: the weights of that group's texels change sides. The pattern as one bit
+    // per texel in texel order, like the weights:
+    uvec2 g1 = uvec2(pm.x | (pm.y << uint(3 * DIM)), pm.y >> uint(32 - 3 * DIM));
+#if BLOCK_DIM == 5
+    const uvec2 all = uvec2(0x1FFFFFFu, 0u);
+#else
+    const uvec2 all = uvec2(0xFFFFFFFFu, 0xFu);
+#endif
+    if (flip0) ws ^= all ^ g1;
+    if (flip1) ws ^= g1;
+
+    // block mode, partition count - 1, seed, 2 bits "same endpoint type for both", endpoint type
+    blk = uvec4(0u);
+#if BLOCK_DIM == 5
+    blk.x = MODE_5x5_Q2;
+#else
+    blk.x = MODE_6x6_Q2;
+#endif
+    blk.x |= (1u << 11u) | (seed << 13u) | (CEM_LDR_RGB_DIRECT << 25u);
+    uint pos = 29u;
+    put_endpoints(blk, pos, q0, q1, ebits, false);
+    put_endpoints(blk, pos, q2, q3, ebits, false);
+    put_weights(blk, ws);
+    return true;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// two partitions (4x4 only)
+//
+// The texels are split in two groups, each with its own colour line, so a block with a hard edge
+// between two areas no longer has to put both on one line. The format only offers a fixed set of
+// split patterns; the table gives the closest one to a wanted split.
+// Storage: opaque RGB 6 bit endpoints + 3 weight levels; with alpha RGBA 4 bit + 4 levels.
+// ---------------------------------------------------------------------------
+
+#if TWO_PARTITIONS
+#ifndef PART_CANDIDATES
+#define PART_CANDIDATES 2 // candidate splits tried per block, 1-3
+#endif
+#ifndef PART_MAX_MISMATCH
+#define PART_MAX_MISMATCH 2 // skip a candidate split when the closest pattern differs in more texels than this
+#endif
+
+uint nearest_pattern(uint mask)
+{
+    return texelFetch(uPartLut, ivec2(int(mask & 255u), int((mask >> 8u) & 255u)), 0).r;
+}
+
+// Two passes over the block, both groups at once: the bounding boxes, then the weights and the
+// sums for the refit. Sums are kept for the whole block and for group 1; group 0 is the
+// difference. No branch per texel: a driver that unrolls these loops (Mesa) would otherwise
+// turn each into sixteen branches.
+// best: the error to beat; the block is only packed (and true returned) when the split is better.
+bool encode_two_partitions(uint lut, bool opaque, inout float best, out uvec4 blk)
+{
+    uint pm = lut >> 16u; // bit i: group of texel i
+    int ebits = opaque ? 6 : 4;
+    float wmax = opaque ? 2.0 : 3.0;
+
+    TV mn0 = TV(255.0), mx0 = TV(0.0), mn1 = TV(255.0), mx1 = TV(0.0);
+    TV sa = TV(0.0), s1 = TV(0.0);
+    vec3 xra = vec3(0.0), xr1 = vec3(0.0); // opaque: r*g, r*b, g*b; with alpha: r*(g, b, a)
+#if HAS_ALPHA
+    vec3 xga = vec3(0.0), xg1 = vec3(0.0); // g*b, g*a, b*a
+#endif
+    float cnt1 = 0.0;
+    for (int i = 0; i < uN; ++i)
+    {
+        TV t = texel(i);
+        bool g = ((pm >> uint(i)) & 1u) != 0u;
+        float gf = float(g);
+        TV lo = min(g ? mn1 : mn0, t);
+        TV hi = max(g ? mx1 : mx0, t);
+        mn0 = g ? mn0 : lo; mn1 = g ? lo : mn1;
+        mx0 = g ? mx0 : hi; mx1 = g ? hi : mx1;
+        sa += t;
+        s1 += gf * t;
+        cnt1 += gf;
+#if HAS_ALPHA
+        vec3 pr = t.r * t.gba;
+        vec3 pg = vec3(t.g * t.ba, t.b * t.a);
+        xga += pg;
+        xg1 += gf * pg;
+#else
+        vec3 pr = vec3(t.r * t.gb, t.g * t.b);
+#endif
+        xra += pr;
+        xr1 += gf * pr;
+    }
+    float cnt0 = float(BLOCK_SIZE) - cnt1;
+
+    TV e0, d0, e1, d1; // group 0 and group 1: first endpoint, step to the second
+#if HAS_ALPHA
+    box_pair(mn0, mx0, sa - s1, cnt0, xra - xr1, xga - xg1, ebits, e0, d0);
+    box_pair(mn1, mx1, s1, cnt1, xr1, xg1, ebits, e1, d1);
+#else
+    box_pair(mn0, mx0, sa - s1, cnt0, xra - xr1, ebits, e0, d0);
+    box_pair(mn1, mx1, s1, cnt1, xr1, ebits, e1, d1);
+#endif
+    vec2 inv = wmax / max(vec2(dot(d0, d0), dot(d1, d1)), vec2(SMALL_VALUE));
+
+    uint wq = 0u; // 2 bits per texel
+    S2 swa = S2(0.0), sw1 = S2(0.0);
+    S2 swwa = S2(0.0), sww1 = S2(0.0);
+    TV swta = TV(0.0), swt1 = TV(0.0);
+    float sqqa = 0.0, sqq1 = 0.0;
+#if WEIGHTED
+    float nna = 0.0, nn1 = 0.0; // sum of the colour weights
+    sa = vec4(0.0);
+    s1 = vec4(0.0);
+#endif
+    for (int i = 0; i < uN; ++i)
+    {
+        TV t = texel(i);
+        bool g = ((pm >> uint(i)) & 1u) != 0u;
+        float gf = float(g);
+        float q = floor(clamp(dot(t - (g ? e1 : e0), g ? d1 : d0) * (g ? inv.y : inv.x), 0.0, wmax) + 0.5);
+        float wu = opaque ? q * 0.5 : floor(q * 21.34) * (1.0 / 64.0); // 0,32,64 or 0,21,43,64
+        wq |= uint(q) << uint(2 * i);
+#if WEIGHTED
+        vec2 om = vec2(t.a * (1.0 / 255.0), 1.0);
+        vec4 ot = om.xxxy * t;
+        vec2 wo = wu * om;
+        vec4 wt = wu * ot;
+        float qq = dot(ot, t);
+        nna += om.x;      nn1 += gf * om.x;
+        swa += wo;        sw1 += gf * wo;
+        swwa += wu * wo;  sww1 += gf * wu * wo;
+        swta += wt;       swt1 += gf * wt;
+        sa += ot;         s1 += gf * ot;
+        sqqa += qq;       sqq1 += gf * qq;
+#else
+        float qq = dot(t, t);
+        TV wt = wu * t;
+        swa += wu;        sw1 += gf * wu;
+        swwa += wu * wu;  sww1 += gf * wu * wu;
+        swta += wt;       swt1 += gf * wt;
+        sqqa += qq;       sqq1 += gf * qq;
+#endif
+    }
+
+#if WEIGHTED
+    vec2 nn0 = vec2(nna - nn1, cnt0);
+    vec2 nn1v = vec2(nn1, cnt1);
+#else
+    float nn0 = cnt0;
+    float nn1v = cnt1;
+#endif
+    // the stored values of the box endpoints: quantizing a decoded value gives it back
+    TV q0 = ep_quant(e0, ebits), q1 = ep_quant(e0 + d0, ebits);
+    refit(nn0, swa - sw1, swwa - sww1, swta - swt1, sa - s1, ebits, q0, q1);
+    float err = group_error(nn0, swa - sw1, swwa - sww1, swta - swt1, sa - s1, sqqa - sqq1, ebits, q0, q1);
+    TV q2 = ep_quant(e1, ebits), q3 = ep_quant(e1 + d1, ebits);
+    refit(nn1v, sw1, sww1, swt1, s1, ebits, q2, q3);
+    err += group_error(nn1v, sw1, sww1, swt1, s1, sqq1, ebits, q2, q3);
+    if (err >= best)
+        return false; // most splits lose: skip the packing
+    best = err;
+
+    // block mode, partition count - 1, seed, 2 bits "same endpoint type for both", endpoint type
+    blk = uvec4(0u);
+    uint mode = opaque ? MODE_4x4_Q3 : MODE_4x4_Q4;
+    uint cem = opaque ? CEM_LDR_RGB_DIRECT : CEM_LDR_RGBA_DIRECT; // in a variable: see encode_block
+    blk.x = mode | (1u << 11u) | ((lut & 1023u) << 13u) | (cem << 25u);
+    uint pos = 29u;
+    put_endpoints(blk, pos, q0, q1, ebits, !opaque);
+    put_endpoints(blk, pos, q2, q3, ebits, !opaque);
+
+    uvec2 ws = uvec2(wq, 0u); // with alpha: two bits per weight, stored as they are
+    if (opaque)
+    {
+        ws.x = 0u;
+        for (int g = 0; g < 4; ++g)
+        {
+            uint grp = 0u;
+            for (int j = 0; j < 5; ++j)
+            {
+                int i = g * 5 + j;
+                if (i >= 16)
+                    break;
+                grp |= ((wq >> uint(2 * i)) & 3u) << uint(4 * j);
+            }
+            ws.x |= trit_group_bits(grp, 0u) << uint(8 * g);
+        }
+    }
+    put_weights(blk, ws);
+    return true;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // dual-plane encoding for blocks with alpha (4x4 only)
@@ -386,10 +1285,6 @@ uint assemble_blockmode(uint weight_quantmethod)
 // ---------------------------------------------------------------------------
 
 #if DUAL_PLANE
-#define DUAL_ERR_THRESHOLD 16.0 // skip the dual-plane search when the single plane is already this good
-
-// Error metric used to choose between the encodings: RGB error counts in proportion to the source
-// alpha (the colour under a transparent pixel is invisible), alpha error counts fully.
 float colour_weight(float a)
 {
 #if PREMULTIPLIED
@@ -399,19 +1294,9 @@ float colour_weight(float a)
 #endif
 }
 
-float pixel_error(vec4 t, vec4 decoded)
-{
-    vec4 d = t - decoded;
-#if PREMULTIPLIED
-    return dot(d, d); // premultiplied: the colour of a transparent pixel is real (black)
-#else
-    return (t.a * (1.0 / 255.0)) * dot(d.rgb, d.rgb) + d.a * d.a;
-#endif
-}
-
 uvec4 encode_dual_plane(out float err)
 {
-    int n = min(uN, 16); // 16, but not a compile-time constant: keeps the loops rolled
+    int n = uN; // 16, but not a compile-time constant: keeps the loops rolled
 
     // pass 1: alpha range and alpha-weighted mean colour
     float amin = 255.0;
@@ -445,10 +1330,7 @@ uvec4 encode_dual_plane(out float err)
         c11 += wt * d.y * d.y; c12 += wt * d.y * d.z; c22 += wt * d.z * d.z;
     }
     // divide by the weight sum: the iteration squares the matrix twice and overflows otherwise
-    vec3 axis = eigen_vector(mat4(c00, c01, c02, 0.0,
-                                  c01, c11, c12, 0.0,
-                                  c02, c12, c22, 0.0,
-                                  0.0, 0.0, 0.0, 0.0) / wsum).xyz;
+    vec3 axis = eigen_vector3(vec3(c00, c01, c02) / wsum, vec3(c11, c12, c22) / wsum);
 
     // pass 3: split the colours in two at the mean and take the weighted mean of each side
     vec3 s0 = vec3(0.0), s1 = vec3(0.0);
@@ -489,147 +1371,17 @@ uvec4 encode_dual_plane(out float err)
         bits |= (ahi ? 1u : 0u) << uint(2 * i + 1);
     }
 
-    // Block mode: 4x4 weight grid, 1 bit weights, dual plane (same layout as assemble_blockmode,
-    // R = 2, H = 0, D = 1). Endpoints are RGBA direct, weights are the interleaved bit stream.
-    const uint blockmode = 0x441u;
-    uvec3 q0 = uvec3(r0);
-    uvec3 q1 = uvec3(r1);
-    uvec4 ep_ise = uvec4(q0.r | (q1.r << 8u) | (q0.g << 16u) | (q1.g << 24u),
-                         q0.b | (q1.b << 8u) | (uint(a0) << 16u) | (uint(a1) << 24u), 0u, 0u);
-    uvec4 blk = assemble_block(blockmode, CEM_LDR_RGBA_DIRECT, ep_ise, uvec4(bits, 0u, 0u, 0u));
-    blk.z |= 3u << 30u; // colour component selector = 3 (alpha has its own weights), just below the weights
+    // Endpoints are RGBA direct, weights are the interleaved bit stream; the colour component
+    // selector (3: alpha has its own weights) sits just below the weights.
+    uvec4 blk = uvec4(0u);
+    blk.x = MODE_4x4_Q2_DUAL | (CEM_LDR_RGBA_DIRECT << 13u);
+    uint pos = 17u;
+    put_endpoints(blk, pos, vec4(r0, a0), vec4(r1, a1), 8, true);
+    put_weights(blk, uvec2(bits, 0u));
+    blk.z |= 3u << 30u;
     return blk;
 }
 #endif
-
-uvec4 encode_block(out float single_error)
-{
-    vec4 ep0, ep1;
-    bool flat_block;
-    principal_component_analysis(ep0, ep1, flat_block);
-    if (flat_block)
-    {
-        // Every texel has the same colour: write a constant-colour (void-extent) block. No axis,
-        // weights or bit packing needed, and it is exact. 8 bit -> 16 bit UNORM is a multiply by 257.
-        uvec4 c = uvec4(round(ep0)) * 257u;
-#if !HAS_ALPHA
-        c.a = 65535u;
-#endif
-        single_error = 0.0;
-        return uvec4(0xFFFFFDFCu, 0xFFFFFFFFu, c.r | (c.g << 16u), c.b | (c.a << 16u));
-    }
-
-    // fixed modes: endpoints 8 bit, weights QUANT_6 (alpha) or QUANT_12 (opaque)
-#if HAS_ALPHA
-    const int weight_quantmethod = QUANT_6;
-    const uint color_endpoint_mode = CEM_LDR_RGBA_DIRECT;
-#else
-    const int weight_quantmethod = QUANT_12;
-    const uint color_endpoint_mode = CEM_LDR_RGB_DIRECT;
-#endif
-
-    uint blockmode = assemble_blockmode(uint(weight_quantmethod));
-
-    // endpoints: 8 bit values, the bounded integer sequence is just the bytes
-    uvec4 a = uvec4(round(ep0));
-    uvec4 b = uvec4(round(ep1));
-#if HAS_ALPHA
-    uvec4 ep_ise = uvec4(a.r | (b.r << 8u) | (a.g << 16u) | (b.g << 24u),
-                         a.b | (b.b << 8u) | (a.a << 16u) | (b.a << 24u), 0u, 0u);
-#else
-    uvec4 ep_ise = uvec4(a.r | (b.r << 8u) | (a.g << 16u) | (b.g << 24u),
-                         a.b | (b.b << 8u), 0u, 0u);
-#endif
-
-#if BLOCK_DIM != 4
-    // 5x5 and 6x6: every projection needs 4 texel fetches, so compute each cell once and keep it.
-    // weights: project every grid cell once (kept in registers), then quantize.
-    // A degenerate axis (flat block) gives vec_k = 0, so every projection is 0 and every weight 0.
-    vec4 vec_k = ep1 - ep0;
-    vec_k = (length(vec_k) < SMALL_VALUE) ? vec4(0.0) : normalize(vec_k);
-    float k0 = dot(vec_k, ep0);
-
-    float wv[X_GRIDS * Y_GRIDS];
-    float minw = 1e31;
-    float maxw = -1e31;
-    for (int i = 0; i < X_GRIDS * Y_GRIDS; ++i)
-    {
-        float w = weight_proj(i, vec_k, k0);
-        wv[i] = w;
-        minw = min(w, minw);
-        maxw = max(w, maxw);
-    }
-    float invlen = 1.0 / max(SMALL_VALUE, maxw - minw);
-
-    uvec2 wq = uvec2(0u);
-    for (int i = 0; i < X_GRIDS * Y_GRIDS; ++i)
-    {
-        uint q = scramble_weight(quantize_weight(WEIGHT_RANGE - 1u, (wv[i] - minw) * invlen)) << (uint(i & 7) * 4u);
-        if (i < 8) wq.x |= q; else wq.y |= q;
-    }
-#else
-    // 4x4: first pass finds the projection range, second pass recomputes and quantizes.
-    // This keeps register use at 32 (full occupancy on Mali G31).
-    vec4 vec_k = ep1 - ep0;
-    bool degenerate = length(vec_k) < SMALL_VALUE;
-    vec_k = degenerate ? vec4(0.0) : normalize(vec_k);
-
-    float k0 = dot(vec_k, ep0);
-    const int nw_max = X_GRIDS * Y_GRIDS;
-    int nw = min(uN, nw_max); // 16, but not a compile-time constant (keeps loops rolled)
-    float minw = 0.0;
-    float invlen = 0.0;
-    if (!degenerate)
-    {
-        float maxw = -1e31;
-        minw = 1e31;
-        for (int i = 0; i < nw; ++i)
-        {
-            float w = weight_proj(i, vec_k, k0);
-            minw = min(w, minw);
-            maxw = max(w, maxw);
-        }
-        invlen = 1.0 / max(SMALL_VALUE, maxw - minw);
-    }
-
-    // pass 2: quantize each weight to 4 bits (values < 12) and keep them in two uints
-    uvec2 wq = uvec2(0u);
-#if DUAL_PLANE
-    float single_err = 0.0; // estimated error of this encoding, to compare with the dual-plane one
-    vec4 e0r = vec4(a);
-    vec4 e1r = vec4(b);
-#endif
-    for (int i = 0; i < nw; ++i)
-    {
-#if DUAL_PLANE
-        vec4 t = texel(i);
-        float w = (dot(vec_k, t) - k0 - minw) * invlen; // same value weight_q() computes
-        uint qn = quantize_weight(WEIGHT_RANGE - 1u, w);
-        single_err += pixel_error(t, e0r + (float(qn) / float(WEIGHT_RANGE - 1u)) * (e1r - e0r));
-        uint q = scramble_weight(qn) << (uint(i & 7) * 4u);
-#else
-        uint q = weight_q(i, vec_k, k0, minw, invlen) << (uint(i & 7) * 4u);
-#endif
-        if (i < 8) wq.x |= q; else wq.y |= q;
-    }
-#endif
-
-#define WQ(i) ((((i) < 8 ? wq.x : wq.y) >> (uint((i) & 7) * 4u)) & 15u)
-
-    uvec4 wt_ise = uvec4(0u);
-    uint bitpos = 0u;
-    encode_trit_group(WQ(0), WQ(1), WQ(2), WQ(3), WQ(4), wt_ise, bitpos);
-    encode_trit_group(WQ(5), WQ(6), WQ(7), WQ(8), WQ(9), wt_ise, bitpos);
-    encode_trit_group(WQ(10), WQ(11), WQ(12), WQ(13), WQ(14), wt_ise, bitpos);
-    encode_trit_group(WQ(15), 0u, 0u, 0u, 0u, wt_ise, bitpos);
-
-#if DUAL_PLANE
-    single_error = single_err;
-#else
-    single_error = 0.0;
-#endif
-    return assemble_block(blockmode, color_endpoint_mode, ep_ise, wt_ise);
-}
 
 void main()
 {
@@ -637,18 +1389,131 @@ void main()
     if (b.x >= uBlocks.x || b.y >= uBlocks.y)
         return;
     g_origin = b * DIM;
+    g_last = uTexSize - ivec2(1) - g_origin;
+#if INPUT_BUFFER
+    g_base = g_origin.y * uTexSize.x + g_origin.x;
+#endif
     int index = b.y * uBlocks.x + b.x;
-    float single_err;
-    blocks[index] = encode_block(single_err);
-#if DUAL_PLANE
-    // Written first so the single-plane state is dead before the dual-plane search starts
-    // (this lowers register use: 63 -> 57 on Mali-G31; the other variants stay at 32).
-    if (single_err > DUAL_ERR_THRESHOLD)
+
+    float err, round_err;
+    bool opaque;
+    TV e0, e1;
+    int far;
+    // Written first so the single-plane state is dead before the other searches start
+    // (this lowers register use).
+    blocks[index] = encode_block(err, round_err, opaque, e0, e1, far);
+
+#if GRID_MODE
+    if (round_err > GRID_ERR_THRESHOLD)
     {
-        float dual_err;
-        uvec4 dual_block = encode_dual_plane(dual_err);
-        if (dual_err < single_err)
-            blocks[index] = dual_block;
+        uvec4 blk;
+        if (encode_grid(e0, e1, err, blk))
+            blocks[index] = blk;
+    }
+#endif
+#if DUAL_PLANE
+    if (!opaque && err > DUAL_ERR_THRESHOLD)
+    {
+        float e2;
+        uvec4 blk = encode_dual_plane(e2);
+        if (e2 < err)
+        {
+            blocks[index] = blk;
+            err = e2;
+        }
+    }
+#endif
+#if BIG_PARTITIONS
+    if (err > BIG_ERR_THRESHOLD * float(BLOCK_SIZE))
+    {
+        // As at 4x4: the texels are sorted by which of three colours they are nearest to (the
+        // two endpoints and the texel farthest off their line); each group against the rest is
+        // a candidate split.
+        vec3 third = texel(far);
+        uvec2 gy = uvec2(0u), gz = uvec2(0u); // nearest to e1, nearest to the third colour
+        int i = 0;
+        for (int y = 0; i < uN; ++y)
+        {
+            uvec2 rb = uvec2(0u);
+            for (int x = 0; x < DIM; ++x, ++i)
+            {
+                vec3 t = texel(i);
+                vec3 d0 = t - e0, d1 = t - e1, d2 = t - third;
+                float l0 = dot(d0, d0), l1 = dot(d1, d1), l2 = dot(d2, d2);
+                bool z = l2 < min(l0, l1);
+                bool yb = !z && l1 < l0;
+                rb |= uvec2(uint(yb), uint(z)) << uint(x);
+            }
+            rb <<= uint(DIM * ((y < 3) ? y : y - 3));
+            if (y < 3) { gy.x |= rb.x; gz.x |= rb.y; }
+            else       { gy.y |= rb.x; gz.y |= rb.y; }
+        }
+#if BLOCK_DIM == 5
+        const uvec2 rows = uvec2(0x7FFFu, 0x3FFu);   // three rows, two rows
+#else
+        const uvec2 rows = uvec2(0x3FFFFu, 0x3FFFFu); // three rows each
+#endif
+        uvec3 seed;
+        uvec2 pz, px, py;
+        uvec3 miss = uvec3(nearest_big(gz, seed.x, pz), nearest_big(rows ^ gy ^ gz, seed.y, px), nearest_big(gy, seed.z, py));
+        // try the closest fits first
+        for (int k = 0; k < BIG_CANDIDATES; ++k)
+        {
+            uint best = min(miss.x, min(miss.y, miss.z));
+            if (best > uint(BIG_MAX_MISMATCH))
+                break;
+            uint sd;
+            uvec2 pm;
+            if (miss.x == best)      { sd = seed.x; pm = pz; miss.x = 99u; }
+            else if (miss.y == best) { sd = seed.y; pm = px; miss.y = 99u; }
+            else                     { sd = seed.z; pm = py; miss.z = 99u; }
+            // the same pattern can be the closest to more than one split
+            if (seed.x == sd) miss.x = 99u;
+            if (seed.y == sd) miss.y = 99u;
+            if (seed.z == sd) miss.z = 99u;
+            uvec4 blk;
+            if (encode_two_partitions_big(sd, pm, err, blk))
+                blocks[index] = blk;
+        }
+    }
+#endif
+#if TWO_PARTITIONS
+    if (err > ALT_ERR_THRESHOLD)
+    {
+        // Sort the texels by which of three colours they are nearest to: the two stored endpoints
+        // and the texel farthest off their line. Candidate splits: each of those groups against
+        // the rest. The table says how closely the format can reproduce each split.
+        TV third = texel(far);
+        uvec3 grp = uvec3(0u);
+        for (int i = 0; i < uN; ++i)
+        {
+            TV t = texel(i);
+            TV d0 = t - e0, d1 = t - e1, d2 = t - third;
+            float l0 = dot(d0, d0), l1 = dot(d1, d1), l2 = dot(d2, d2);
+            bool z = l2 < min(l0, l1);
+            bool y = !z && l1 < l0;
+            grp |= uvec3(uint(!z && !y), uint(y), uint(z)) << uint(i);
+        }
+        uvec3 lut = uvec3(nearest_pattern(grp.z), nearest_pattern(grp.x), nearest_pattern(grp.y));
+        uvec3 miss = (lut >> 10u) & 31u;
+        // try the closest fits first; a split that needs more than a few texels moved is no use
+        for (int k = 0; k < PART_CANDIDATES; ++k)
+        {
+            uint best = min(miss.x, min(miss.y, miss.z));
+            if (best > uint(PART_MAX_MISMATCH) || err <= ALT_ERR_THRESHOLD)
+                break;
+            uint pick;
+            if (miss.x == best)      { pick = lut.x; miss.x = 99u; }
+            else if (miss.y == best) { pick = lut.y; miss.y = 99u; }
+            else                     { pick = lut.z; miss.z = 99u; }
+            // the same pattern can be the closest to more than one split
+            if ((miss.x != 99u && (lut.x & 1023u) == (pick & 1023u)) ) miss.x = 99u;
+            if ((miss.y != 99u && (lut.y & 1023u) == (pick & 1023u)) ) miss.y = 99u;
+            if ((miss.z != 99u && (lut.z & 1023u) == (pick & 1023u)) ) miss.z = 99u;
+            uvec4 blk;
+            if (encode_two_partitions(pick, opaque, err, blk))
+                blocks[index] = blk;
+        }
     }
 #endif
 }

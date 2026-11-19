@@ -4,7 +4,8 @@ import subprocess, sys, pathlib, tempfile, re
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 core = args[0] if args else "Mali-G31"
-exe = args[1] if len(args) > 1 else "C:/Program Files/Arm/Arm Performance Studio 2026.6/mali_offline_compiler/malioc.exe"
+import glob
+exe = args[1] if len(args) > 1 else sorted(glob.glob("C:/Program Files/Arm/Arm Performance Studio */mali_offline_compiler/malioc.exe"))[-1]
 src = (ROOT / "shaders/astc_encode.comp").read_text()
 with tempfile.TemporaryDirectory() as d:
     for block in (4, 5, 6):

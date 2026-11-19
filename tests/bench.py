@@ -11,10 +11,11 @@ BASE = ROOT / "baseline"
 def run(ctx, rgba, block, alpha, n=10):
     h, w, _ = rgba.shape
     prog = ctx.compute_shader(t.shader_source(block, alpha))
-    tex = ctx.texture((w, h), 4, rgba.tobytes()); tex.filter = (moderngl.NEAREST,) * 2; tex.use(0)
+    tex = ctx.texture((w, h), 4, rgba.tobytes()); tex.filter = (moderngl.NEAREST,) * 2; tex.use(0); t.bind_lut(ctx)
     bx, by = (w + block - 1) // block, (h + block - 1) // block
     buf = ctx.buffer(reserve=bx * by * 16); buf.bind_to_storage_buffer(0)
-    prog["uTexSize"].value = (w, h); prog["uBlocks"].value = (bx, by); prog["uN"].value = block * block
+    prog["uTexSize"].value = (w, h); prog["uBlocks"].value = (bx, by)
+    if "uN" in prog: prog["uN"].value = block * block
     g = ((bx + 7) // 8, (by + 7) // 8, 1)
     prog.run(*g); ctx.finish()
     t0 = time.perf_counter()

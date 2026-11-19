@@ -1,3 +1,8 @@
 build/
 tests/baseline/
 build-*/
+tests/corpus/
+__pycache__/
+tests/baseline_shader.comp
+tests/baseline_eval.json
+tests/out/
