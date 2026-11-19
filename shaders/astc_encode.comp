@@ -105,10 +105,16 @@ precision highp usampler2D;
 #define MODE_4x4_Q12 0x251u
 #define MODE_4x4_Q6  0x043u
 #define MODE_4x4_Q10 0x241u
+#define MODE_4x4_Q16 0x242u
+#define MODE_4x4_Q32 0x253u
+#define CEM_LDR_LUMA_DIRECT 0u
 #define MODE_4x4_Q3  0x051u
 #define MODE_4x4_Q4  0x042u
 #define MODE_4x4_Q5  0x052u
 #define MODE_4x4_Q2_DUAL 0x441u
+#define MODE_4x4_Q3_DUAL 0x451u
+#define MODE_4x4_Q4_DUAL 0x442u
+#define CEM_LDR_LUMA_ALPHA_DIRECT 4u
 #define MODE_5x5_Q5  0x0F2u
 #define MODE_5x5_Q3  0x0F1u
 #define MODE_5x5_Q2  0x0E1u
@@ -118,6 +124,9 @@ precision highp usampler2D;
 // Weights are packed in groups of five (trits, or single bits) or three (quints).
 
 // Sum of squared error over a block above which the more expensive encodings are tried.
+#ifndef GREY_TOLERANCE
+#define GREY_TOLERANCE 2.0 // channels of a visible texel this close together: the block is stored as grey
+#endif
 #ifndef ALT_ERR_THRESHOLD
 #define ALT_ERR_THRESHOLD 1024.0
 #endif
@@ -406,7 +415,7 @@ void ep_pair(TV lo, TV hi, int bits, out TV q0, out TV q1, out TV u0, out TV u1)
 // group: nn = sum(om), sw = sum(om*w), sww = sum(om*w*w), swt = sum(om*w*t), st = sum(om*t),
 // where om is 1, or with straight alpha the weight of the texel's colour / alpha error.
 // The pair is replaced when the system is solvable and the result keeps its order.
-void refit(S2 nn, S2 sw, S2 sww, TV swt, TV st, int bits, inout TV q0, inout TV q1)
+void refit(S2 nn, S2 sw, S2 sww, TV swt, TV st, int bits, bool grey, inout TV q0, inout TV q1)
 {
     S2 al = nn - 2.0 * sw + sww;
     S2 be = sw - sww;
@@ -419,8 +428,15 @@ void refit(S2 nn, S2 sw, S2 sww, TV swt, TV st, int bits, inout TV q0, inout TV 
         return;
 #endif
     TV a = st - swt;
-    TV r0 = ep_quant((PER_CHANNEL(sww) * a - PER_CHANNEL(be) * swt) / PER_CHANNEL(det), bits);
-    TV r1 = ep_quant((PER_CHANNEL(al) * swt - PER_CHANNEL(be) * a) / PER_CHANNEL(det), bits);
+    TV r0 = (PER_CHANNEL(sww) * a - PER_CHANNEL(be) * swt) / PER_CHANNEL(det);
+    TV r1 = (PER_CHANNEL(al) * swt - PER_CHANNEL(be) * a) / PER_CHANNEL(det);
+    if (grey)
+    {
+        r0.rgb = vec3((r0.r + r0.g + r0.b) * (1.0 / 3.0));
+        r1.rgb = vec3((r1.r + r1.g + r1.b) * (1.0 / 3.0));
+    }
+    r0 = ep_quant(r0, bits);
+    r1 = ep_quant(r1, bits);
     a = ep_unquant(r1, bits) - ep_unquant(r0, bits);
     if (a.r + a.g + a.b >= 0.0)
     {
@@ -493,7 +509,7 @@ void put2(inout uvec2 o, uint pos, uint v)
 // Returns the stored endpoints (e0, e1), the squared error and the texel farthest off the line.
 // ---------------------------------------------------------------------------
 
-uvec4 encode_block(out float err, out float round_err, out bool opaque, out TV e0, out TV e1, out int far)
+uvec4 encode_block(out float err, out float round_err, out bool opaque, out bool grey, out TV e0, out TV e1, out int far)
 {
     // pass 1. Moments are taken relative to the first texel: sums of products of raw 0..255
     // values would lose the low bits that the covariance of a smooth block lives in.
@@ -505,6 +521,14 @@ uvec4 encode_block(out float err, out float round_err, out bool opaque, out TV e
     vec4 xa = vec4(0.0); // a*(r, g, b, a)
     float amin = 0.0;
 #endif
+#if BLOCK_DIM == 4
+    // largest difference between two channels of a visible texel: 0 for a grey block
+    vec2 ref_cd = vec2(ref.r - ref.g, ref.g - ref.b);
+    float chroma = max(abs(ref_cd.x), abs(ref_cd.y));
+#if HAS_ALPHA
+    if (ref.a < 0.5) chroma = 0.0;
+#endif
+#endif
     for (int i = 1; i < uN; ++i)
     {
         TV c = texel(i) - ref;
@@ -515,10 +539,18 @@ uvec4 encode_block(out float err, out float round_err, out bool opaque, out TV e
         xa += c.a * c;
         amin = min(amin, c.a);
 #endif
+#if BLOCK_DIM == 4
+        vec2 cd = abs(vec2(c.r - c.g, c.g - c.b) + ref_cd);
+#if HAS_ALPHA
+        if (c.a + ref.a > 0.5)
+#endif
+            chroma = max(chroma, max(cd.x, cd.y));
+#endif
     }
 
     err = 0.0;
     round_err = 0.0;
+    grey = false;
     far = 0;
     e0 = ref;
     e1 = ref;
@@ -568,11 +600,14 @@ uvec4 encode_block(out float err, out float round_err, out bool opaque, out TV e
 #if BLOCK_DIM == 4
     // RGB: 8 bit endpoints, 12 weight levels. RGBA: 7 bit endpoints and 10 levels (8 bit would
     // leave 6 levels, too few for a soft alpha edge).
+    // Grey: luminance endpoints (8 bit) and 32 weight levels, with alpha luminance + alpha and 16.
     bool q12 = opaque;
-    int ebits = q12 ? 8 : 7;
-    float wmax = q12 ? 11.0 : 9.0;
-    uint mode = q12 ? MODE_4x4_Q12 : MODE_4x4_Q10;
+    grey = chroma <= GREY_TOLERANCE;
+    int ebits = (q12 || grey) ? 8 : 7;
+    float wmax = grey ? (opaque ? 31.0 : 15.0) : (q12 ? 11.0 : 9.0);
+    uint mode = grey ? (opaque ? MODE_4x4_Q32 : MODE_4x4_Q16) : (q12 ? MODE_4x4_Q12 : MODE_4x4_Q10);
     uint group4 = q12 ? 20u : 12u; // 4 * weights per group
+    uvec4 gw = uvec4(0u);          // grey: the weights, 5 or 4 bits each
 #else
     const int ebits = 8;
 #endif
@@ -589,7 +624,15 @@ uvec4 encode_block(out float err, out float round_err, out bool opaque, out TV e
 
     {
         TV q0, q1;
-        ep_pair(mean + axis * lo, mean + axis * hi, ebits, q0, q1, e0, e1);
+        TV p0 = mean + axis * lo, p1 = mean + axis * hi;
+#if BLOCK_DIM == 4
+        if (grey)
+        {
+            p0.rgb = vec3((p0.r + p0.g + p0.b) * (1.0 / 3.0));
+            p1.rgb = vec3((p1.r + p1.g + p1.b) * (1.0 / 3.0));
+        }
+#endif
+        ep_pair(p0, p1, ebits, q0, q1, e0, e1);
     }
     TV d = e1 - e0;
 #if WEIGHTED
@@ -645,7 +688,15 @@ uvec4 encode_block(out float err, out float round_err, out bool opaque, out TV e
             uint q = uint(w * wmax + 0.5);
 #if BLOCK_DIM == 4
             float wu;
-            if (q12)
+            if (grey)
+            {
+                // plain bits: the decoder repeats them to 6 bits and skips 32
+                uint u = opaque ? ((q << 1u) | (q >> 4u)) : ((q << 2u) | (q >> 2u));
+                wu = float(u + ((u > 32u) ? 1u : 0u)) * (1.0 / 64.0);
+                uint nbits = opaque ? 5u : 4u;
+                put(gw, uint(i) * nbits, q);
+            }
+            else if (q12)
             {
                 wu = unquant_weight(q, true);
                 q = scramble_weight(q, true);
@@ -737,8 +788,16 @@ uvec4 encode_block(out float err, out float round_err, out bool opaque, out TV e
         a = (ga * r0 - be * r1) / det;
         b = (al * r1 - be * r0) / det;
         // as the decoder will see them
-        TV n0 = ep_unquant(ep_quant(e0 + a * d, ebits), ebits);
-        TV n1 = ep_unquant(ep_quant(e0 + b * d, ebits), ebits);
+        TV n0 = e0 + a * d, n1 = e0 + b * d;
+#if BLOCK_DIM == 4
+        if (grey)
+        {
+            n0.rgb = vec3((n0.r + n0.g + n0.b) * (1.0 / 3.0));
+            n1.rgb = vec3((n1.r + n1.g + n1.b) * (1.0 / 3.0));
+        }
+#endif
+        n0 = ep_unquant(ep_quant(n0, ebits), ebits);
+        n1 = ep_unquant(ep_quant(n1, ebits), ebits);
         TV dn = n1 - n0;
         if (dn.r + dn.g + dn.b >= 0.0)
         {
@@ -763,6 +822,23 @@ uvec4 encode_block(out float err, out float round_err, out bool opaque, out TV e
     // A choice between two literals goes into a variable before it is shifted: Arm's old
     // Mali-T860 compiler (r18) otherwise works it out in 16 bits and the top bit is lost.
     uint cem = opaque ? CEM_LDR_RGB_DIRECT : CEM_LDR_RGBA_DIRECT;
+#if BLOCK_DIM == 4
+    if (grey)
+    {
+        // luminance pair [alpha pair]; the 80 or 64 weight bits reach into the third word
+        cem = opaque ? CEM_LDR_LUMA_DIRECT : CEM_LDR_LUMA_ALPHA_DIRECT;
+        blk.x = mode | (cem << 13u);
+        put(blk, 17u, uint(e0.r) | (uint(e1.r) << 8u));
+#if HAS_ALPHA
+        if (!opaque)
+            put(blk, 33u, uint(e0.a) | (uint(e1.a) << 8u));
+#endif
+        blk.w |= bitfieldReverse(gw.x);
+        blk.z |= bitfieldReverse(gw.y);
+        blk.y |= bitfieldReverse(gw.z);
+        return blk;
+    }
+#endif
     blk.x = mode | (cem << 13u);
     uint pos = 17u;
     // quantizing a decoded value gives the stored one back
@@ -925,6 +1001,16 @@ bool encode_grid(TV e0, TV e1, inout float best, out uvec4 blk)
 #endif
 
 #if TWO_PARTITIONS || BIG_PARTITIONS
+// Makes a pair (first endpoint, step to the second) grey: every colour channel the mean of the three.
+void grey_pair(int bits, inout TV e, inout TV d)
+{
+    TV b = e + d;
+    e.rgb = vec3((e.r + e.g + e.b) * (1.0 / 3.0));
+    b.rgb = vec3((b.r + b.g + b.b) * (1.0 / 3.0));
+    e = ep_unquant(ep_quant(e, bits), bits);
+    d = ep_unquant(ep_quant(b, bits), bits) - e;
+}
+
 // Endpoints of one group: opposite corners of its bounding box. Which corner each channel starts
 // from follows the sign of its covariance with the widest channel. Exact for two colours.
 // e0: the first endpoint as decoded, d: the step to the second.
@@ -1172,11 +1258,13 @@ uint nearest_pattern(uint mask)
 // difference. No branch per texel: a driver that unrolls these loops (Mesa) would otherwise
 // turn each into sixteen branches.
 // best: the error to beat; the block is only packed (and true returned) when the split is better.
-bool encode_two_partitions(uint lut, bool opaque, inout float best, out uvec4 blk)
+bool encode_two_partitions(uint lut, bool opaque, bool grey, inout float best, out uvec4 blk)
 {
     uint pm = lut >> 16u; // bit i: group of texel i
-    int ebits = opaque ? 5 : 4;
-    float wmax = opaque ? 4.0 : 3.0;
+    // Grey blocks store luminance [and alpha] pairs, which leaves room for 8 bit endpoints and 16
+    // weight levels (opaque) or 7 bit and 6 levels (with alpha).
+    int ebits = grey ? (opaque ? 8 : 7) : (opaque ? 5 : 4);
+    float wmax = grey ? (opaque ? 15.0 : 5.0) : (opaque ? 4.0 : 3.0);
 
     TV mn0 = TV(255.0), mx0 = TV(0.0), mn1 = TV(255.0), mx1 = TV(0.0);
     TV sa = TV(0.0), s1 = TV(0.0);
@@ -1218,6 +1306,11 @@ bool encode_two_partitions(uint lut, bool opaque, inout float best, out uvec4 bl
     box_pair(mn0, mx0, sa - s1, cnt0, xra - xr1, ebits, e0, d0);
     box_pair(mn1, mx1, s1, cnt1, xr1, ebits, e1, d1);
 #endif
+    if (grey)
+    {
+        grey_pair(ebits, e0, d0);
+        grey_pair(ebits, e1, d1);
+    }
     vec2 inv = wmax / max(vec2(dot(d0, d0), dot(d1, d1)), vec2(SMALL_VALUE));
 
     uint wq = 0u; // 2 bits per texel
@@ -1238,7 +1331,21 @@ bool encode_two_partitions(uint lut, bool opaque, inout float best, out uvec4 bl
         float gf = float(g);
         float q = floor(clamp(dot(t - (g ? e1 : e0), g ? d1 : d0) * (g ? inv.y : inv.x), 0.0, wmax) + 0.5);
         float wu = opaque ? q * 0.25 : floor(q * 21.34) * (1.0 / 64.0); // 0,16,..64 or 0,21,43,64
-        if (i < 8) w4.x |= uint(q) << uint(4 * i); else w4.y |= uint(q) << uint(4 * i - 32);
+        uint qs = uint(q);
+        if (grey)
+        {
+            if (opaque)
+            {
+                uint u = (qs << 2u) | (qs >> 2u); // 16 levels, plain bits
+                wu = float(u + ((u > 32u) ? 1u : 0u)) * (1.0 / 64.0);
+            }
+            else
+            {
+                wu = unquant_weight(qs, false);   // 6 levels
+                qs = scramble_weight(qs, false);
+            }
+        }
+        if (i < 8) w4.x |= qs << uint(4 * i); else w4.y |= qs << uint(4 * i - 32);
         wq |= uint(q) << uint(2 * i); // only right with alpha (q < 4), and only used there
 #if WEIGHTED
         vec2 om = vec2(t.a * (1.0 / 255.0), 1.0);
@@ -1271,10 +1378,10 @@ bool encode_two_partitions(uint lut, bool opaque, inout float best, out uvec4 bl
 #endif
     // the stored values of the box endpoints: quantizing a decoded value gives it back
     TV q0 = ep_quant(e0, ebits), q1 = ep_quant(e0 + d0, ebits);
-    refit(nn0, swa - sw1, swwa - sww1, swta - swt1, sa - s1, ebits, q0, q1);
+    refit(nn0, swa - sw1, swwa - sww1, swta - swt1, sa - s1, ebits, grey, q0, q1);
     float err = group_error(nn0, swa - sw1, swwa - sww1, swta - swt1, sa - s1, sqqa - sqq1, ebits, q0, q1);
     TV q2 = ep_quant(e1, ebits), q3 = ep_quant(e1 + d1, ebits);
-    refit(nn1v, sw1, sww1, swt1, s1, ebits, q2, q3);
+    refit(nn1v, sw1, sww1, swt1, s1, ebits, grey, q2, q3);
     err += group_error(nn1v, sw1, sww1, swt1, s1, sqq1, ebits, q2, q3);
     if (err >= best)
         return false; // most splits lose: skip the packing
@@ -1284,6 +1391,41 @@ bool encode_two_partitions(uint lut, bool opaque, inout float best, out uvec4 bl
     blk = uvec4(0u);
     uint mode = opaque ? MODE_4x4_Q5 : MODE_4x4_Q4;
     uint cem = opaque ? CEM_LDR_RGB_DIRECT : CEM_LDR_RGBA_DIRECT; // in a variable: see encode_block
+    if (grey)
+    {
+        mode = opaque ? MODE_4x4_Q16 : MODE_4x4_Q6;
+        cem = opaque ? CEM_LDR_LUMA_DIRECT : CEM_LDR_LUMA_ALPHA_DIRECT;
+        blk.x = mode | (1u << 11u) | ((lut & 1023u) << 13u) | (cem << 25u);
+        if (opaque)
+        {
+            // luminance pairs of both groups, 8 bit; 16 weights of 4 plain bits
+            put(blk, 29u, uint(q0.r) | (uint(q1.r) << 8u) | (uint(q2.r) << 16u) | (uint(q3.r) << 24u));
+            put_weights(blk, w4);
+        }
+#if HAS_ALPHA
+        else
+        {
+            // per group: luminance pair, alpha pair, 7 bit
+            put(blk, 29u, uint(q0.r) | (uint(q1.r) << 7u) | (uint(q0.a) << 14u) | (uint(q1.a) << 21u));
+            put(blk, 57u, uint(q2.r) | (uint(q3.r) << 7u) | (uint(q2.a) << 14u) | (uint(q3.a) << 21u));
+            // 6 levels: five weights in 13 bits, the sixteenth in 3
+            uvec2 gws = uvec2(0u);
+            for (int g = 0; g < 4; ++g)
+            {
+                uint grp = 0u;
+                for (int j = 0; j < 5; ++j)
+                {
+                    int i = g * 5 + j;
+                    if (i < 16)
+                        grp |= ((((i < 8) ? w4.x : w4.y) >> uint(4 * (i & 7))) & 15u) << uint(4 * j);
+                }
+                put2(gws, uint(13 * g), trit_group_bits(grp, 1u) & ((g == 3) ? 7u : 8191u));
+            }
+            put_weights(blk, gws);
+        }
+#endif
+        return true;
+    }
     blk.x = mode | (1u << 11u) | ((lut & 1023u) << 13u) | (cem << 25u);
     uint pos = 29u;
     put_endpoints(blk, pos, q0, q1, ebits, !opaque);
@@ -1339,6 +1481,7 @@ uvec4 encode_dual_plane(out float err)
     float amax = 0.0;
     vec3 msum = vec3(0.0);
     float wsum = 0.0;
+    float chroma = 0.0; // largest difference between two channels of a visible texel
     for (int i = 0; i < n; ++i)
     {
         vec4 t = texel(i);
@@ -1347,6 +1490,8 @@ uvec4 encode_dual_plane(out float err)
         float wt = colour_weight(t.a);
         msum += wt * t.rgb;
         wsum += wt;
+        if (t.a > 0.5)
+            chroma = max(chroma, max(abs(t.r - t.g), abs(t.g - t.b)));
     }
     if (amax - amin < 1.0)
     {
@@ -1371,13 +1516,22 @@ uvec4 encode_dual_plane(out float err)
     // pass 3: split the colours in two at the mean and take the weighted mean of each side
     vec3 s0 = vec3(0.0), s1 = vec3(0.0);
     float w0 = 0.0, w1 = 0.0;
+    float plo = 1e30, phi = -1e30;
     for (int i = 0; i < n; ++i)
     {
         vec4 t = texel(i);
         float wt = colour_weight(t.a);
-        if (dot(t.rgb - mean, axis) > 0.0) { s1 += wt * t.rgb; w1 += wt; }
-        else                               { s0 += wt * t.rgb; w0 += wt; }
+        float pr = dot(t.rgb - mean, axis);
+        if (pr > 0.0) { s1 += wt * t.rgb; w1 += wt; }
+        else          { s0 += wt * t.rgb; w0 += wt; }
+        if (t.a > 0.5)
+        {
+            plo = min(plo, pr);
+            phi = max(phi, pr);
+        }
     }
+    if (plo > phi)
+        plo = phi = 0.0; // nothing visible
     vec3 e0 = (w0 > 0.0) ? s0 / w0 : ((w1 > 0.0) ? s1 / w1 : mean);
     vec3 e1 = (w1 > 0.0) ? s1 / w1 : e0;
 
@@ -1392,9 +1546,34 @@ uvec4 encode_dual_plane(out float err)
     float a1 = round(amax);
     float amid = 0.5 * (a0 + a1);
 
-    // pass 4: each pixel takes the nearer colour endpoint and the nearer alpha endpoint
+    // The soft encoding: colour along the axis and alpha each with their own weights of 3 levels
+    // (7 bit RGBA endpoints), or for a grey block 4 levels each (luminance + alpha, 8 bit).
+    bool grey = chroma <= GREY_TOLERANCE;
+    int sbits = grey ? 8 : 7;
+    float levels = grey ? 3.0 : 2.0;
+    vec4 u0 = vec4(mean + axis * plo, amin);
+    vec4 u1 = vec4(mean + axis * phi, amax);
+    if (grey)
+    {
+        u0.rgb = vec3((u0.r + u0.g + u0.b) * (1.0 / 3.0));
+        u1.rgb = vec3((u1.r + u1.g + u1.b) * (1.0 / 3.0));
+    }
+    u0 = ep_unquant(ep_quant(u0, sbits), sbits);
+    u1 = ep_unquant(ep_quant(u1, sbits), sbits);
+    if (!grey && u0.r + u0.g + u0.b > u1.r + u1.g + u1.b)
+    {
+        vec3 tmp = u0.rgb; u0.rgb = u1.rgb; u1.rgb = tmp; // stored order; alpha has its own weights
+    }
+    vec4 ud = u1 - u0;
+    float cinv = 1.0 / max(dot(ud.rgb, ud.rgb), SMALL_VALUE);
+    float ainv = 1.0 / max(ud.a, SMALL_VALUE);
+
+    // pass 4: each pixel takes the nearer colour endpoint and the nearer alpha endpoint, and for
+    // the soft encoding its level along the colour line and its alpha level
     uint bits = 0u;
+    uvec2 soft = uvec2(0u); // per texel: colour level, alpha level, 2 bits each
     err = 0.0;
+    float serr = 0.0;
     for (int i = 0; i < n; ++i)
     {
         vec4 t = texel(i);
@@ -1405,6 +1584,48 @@ uvec4 encode_dual_plane(out float err)
         err += pixel_error(t, vec4(hi ? r1 : r0, ahi ? a1 : a0));
         bits |= (hi ? 1u : 0u) << uint(2 * i);
         bits |= (ahi ? 1u : 0u) << uint(2 * i + 1);
+
+        vec2 q = floor(clamp(vec2(dot(t.rgb - u0.rgb, ud.rgb) * cinv, (t.a - u0.a) * ainv), 0.0, 1.0) * levels + 0.5);
+        vec2 wu = grey ? floor(q * 21.34) * (1.0 / 64.0) : q * 0.5; // 0 21 43 64 or 0 32 64
+        serr += pixel_error(t, vec4(u0.rgb + wu.x * ud.rgb, u0.a + wu.y * ud.a));
+        uint both = uint(q.x) | (uint(q.y) << 2u);
+        if (i < 8) soft.x |= both << uint(4 * i); else soft.y |= both << uint(4 * i - 32);
+    }
+
+    if (serr < err)
+    {
+        err = serr;
+        uvec4 blk = uvec4(0u);
+        uint pos = 17u;
+        if (grey)
+        {
+            // luminance pair, alpha pair, 2 bits per weight as they are, selector below the weights
+            blk.x = MODE_4x4_Q4_DUAL | (CEM_LDR_LUMA_ALPHA_DIRECT << 13u);
+            put(blk, 17u, uint(u0.r) | (uint(u1.r) << 8u));
+            put(blk, 33u, uint(u0.a) | (uint(u1.a) << 8u));
+            put_weights(blk, soft);
+            blk.y |= 3u << 30u;
+        }
+        else
+        {
+            // 32 weights of 3 levels, colour and alpha in turn: five to a byte, the last two in 4 bits
+            blk.x = MODE_4x4_Q3_DUAL | (CEM_LDR_RGBA_DIRECT << 13u);
+            put_endpoints(blk, pos, ep_quant(u0, 7), ep_quant(u1, 7), 7, true);
+            uvec2 ws = uvec2(0u);
+            for (int g = 0; g < 7; ++g)
+            {
+                uint v[5];
+                for (int j = 0; j < 5; ++j)
+                {
+                    int k = g * 5 + j;
+                    v[j] = (k < 32) ? ((((k < 16) ? soft.x : soft.y) >> uint(2 * (k & 15))) & 3u) : 0u;
+                }
+                put2(ws, uint(8 * g), pack_trits(v[0], v[1], v[2], v[3], v[4]) & ((g == 6) ? 15u : 255u));
+            }
+            put_weights(blk, ws);
+            blk.z |= 3u << 10u;
+        }
+        return blk;
     }
 
     // Endpoints are RGBA direct, weights are the interleaved bit stream; the colour component
@@ -1437,7 +1658,8 @@ void main()
     int far;
     // Written first so the single-plane state is dead before the other searches start
     // (this lowers register use).
-    blocks[index] = encode_block(err, round_err, opaque, e0, e1, far);
+    bool grey;
+    blocks[index] = encode_block(err, round_err, opaque, grey, e0, e1, far);
 
 #if GRID_MODE
     if (round_err > GRID_ERR_THRESHOLD)
@@ -1547,7 +1769,7 @@ void main()
             if ((miss.y != 99u && (lut.y & 1023u) == (pick & 1023u)) ) miss.y = 99u;
             if ((miss.z != 99u && (lut.z & 1023u) == (pick & 1023u)) ) miss.z = 99u;
             uvec4 blk;
-            if (encode_two_partitions(pick, opaque, err, blk))
+            if (encode_two_partitions(pick, opaque, grey, err, blk))
                 blocks[index] = blk;
         }
     }
