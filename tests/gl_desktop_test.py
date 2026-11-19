@@ -16,13 +16,17 @@ def shader_source(block, alpha, normal=False, premult=False, extra=""):
     return head + body
 
 _lut = {}
-def bind_lut(ctx):
-    """Partition table for the 4x4 shader, on texture unit 1."""
-    if ctx not in _lut:
+def bind_lut(ctx, block=4):
+    """partition pattern table for the block size, texture unit 1"""
+    if (ctx, block) not in _lut:
         import partition_lut
-        _lut[ctx] = ctx.texture((256, 256), 1, partition_lut.lut().tobytes(), dtype="u4")
-        _lut[ctx].filter = (moderngl.NEAREST, moderngl.NEAREST)
-    _lut[ctx].use(1)
+        if block == 4:
+            tex = ctx.texture((256, 256), 1, partition_lut.lut().tobytes(), dtype="u4")
+        else:
+            tex = ctx.texture((256, 264), 1, partition_lut.big_table(block).tobytes(), dtype="u4")
+        tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        _lut[(ctx, block)] = tex
+    _lut[(ctx, block)].use(1)
 
 def gpu_encode(ctx, rgba, block, alpha):
     h, w, _ = rgba.shape
@@ -31,7 +35,7 @@ def gpu_encode(ctx, rgba, block, alpha):
     tex = ctx.texture((w, h), 4, np.ascontiguousarray(rgba).tobytes())
     tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
     tex.use(0)
-    bind_lut(ctx)
+    bind_lut(ctx, block)
     buf = ctx.buffer(reserve=bx * by * 16)
     buf.bind_to_storage_buffer(0)
     prog["uTexSize"].value = (w, h)

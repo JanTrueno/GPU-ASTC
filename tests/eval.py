@@ -22,7 +22,7 @@ def score(src, dec, has_a):
 def gpu(ctx, rgba, block, alpha, n=5):
     h, w, _ = rgba.shape
     prog = ctx.compute_shader(t.shader_source(block, alpha, extra=EXTRA))
-    tex = ctx.texture((w, h), 4, np.ascontiguousarray(rgba).tobytes()); tex.filter = (moderngl.NEAREST,) * 2; tex.use(0); t.bind_lut(ctx)
+    tex = ctx.texture((w, h), 4, np.ascontiguousarray(rgba).tobytes()); tex.filter = (moderngl.NEAREST,) * 2; tex.use(0); t.bind_lut(ctx, block)
     bx, by = (w + block - 1) // block, (h + block - 1) // block
     if "INPUT_BUFFER 1" in EXTRA:  # the shader reads the pixels from a buffer at binding 1
         ctx.buffer(np.ascontiguousarray(rgba).tobytes()).bind_to_storage_buffer(1)

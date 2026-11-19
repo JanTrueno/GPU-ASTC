@@ -21,7 +21,7 @@ unchanged when writing to another folder. XNA colour is premultiplied by alpha; 
 (`-premult` forces it for PNG). Files whose output is already newer than the input are skipped; `-force` converts everything.
 New input formats: one decode function plus a line in `src/formats.cpp`.
 
-Options: `-q fast|normal|best` 4x4 search effort (see Encoder), `-b auto|4|5|6` block size (auto: 4x4 up to 256x256, thin textures and anything with alpha;
+Options: `-q fast|normal|best` search effort (see Encoder), `-b auto|4|5|6` block size (auto: 4x4 up to 256x256, thin textures and anything with alpha;
 5x5 up to 2048x2048; 6x6 above), `-alpha auto|on|off`, `-norm` normal map, `-upload` self-test of the GPU upload,
 `-mem MB` memory for source files, images and results waiting between reading, encoding and saving (default: 40% of
 the free memory, 64 to 768), `-cache DIR` / `-nocache` where compiled shaders are kept between runs (default
@@ -38,7 +38,10 @@ the free memory, 64 to 768), `-cache DIR` / `-nocache` where compiled shaders ar
   opaque blocks of an alpha texture are stored as RGB. 4x4 blocks that one colour line fits badly also try
   two partitions (`-q normal`, the default; `-q best` tries more, `-q fast` none) and, with alpha, a
   dual-plane mode (exact for "transparent + two colours" pixel art). Smooth opaque 5x5 and 6x6 blocks
-  also try a 4x4 grid of 12-level weights and keep whichever has the lower error.
+  also try a 4x4 grid of 12-level weights and keep whichever has the lower error. Opaque 5x5 and 6x6
+  blocks with a large error try two partitions too, with two colours per partition: `-q normal` only
+  where the error is very large (hard edges: sprites, text, UI), `-q best` on many more blocks,
+  `-q fast` never.
 
 ## Build
 
@@ -50,18 +53,21 @@ SDL_VIDEODRIVER=offscreen ./build/gpuastc in.png out.astc -v
 
 ## Limits
 
-Two partitions only exist for 4x4, and three or four are not implemented, so blocks with four or more
-unrelated colours (and hard edges at 5x5 / 6x6) still look worse than astcenc. On a mixed set of photos,
-screenshots and sprites, 4x4 lands about 3 dB under astcenc's fast preset (2 to 6 dB per image), 5x5 and
-6x6 about 4 dB.
+Three or four partitions are not implemented, and at 5x5 / 6x6 a partition holds two colours without
+steps between them, so blocks with many unrelated colours still look worse than astcenc. On a mixed set of photos,
+screenshots and sprites, 4x4, 5x5 and 6x6 each land about 3 dB under astcenc's fast preset (2 to 6 dB
+per image).
 
 Measured on Mali-G31 with a batch of 12 images of 1 Mpx (photo, sprite sheets, screenshot), GPU time for
 upload + encode + readback in ms, against the encoder this one started from:
 
-| | 4x4 `-q fast` | 4x4 `-q normal` | 5x5 | 6x6 | before: 4x4 / 5x5 / 6x6 |
-|---|---|---|---|---|---|
-| Arm's driver (RG351P) | 380 | 545 | 410 | 445 | 540 / 590 / 545 |
-| Mesa Panfrost (RG-34XXSP) | 510 | 780 | 635 | 645 | 775 / 690 / 610 |
+| | 4x4 fast | 4x4 normal | 5x5 fast | 5x5 normal | 6x6 fast | 6x6 normal | before: 4x4 / 5x5 / 6x6 |
+|---|---|---|---|---|---|---|---|
+| Arm's driver (RG351P) | 360 | 525 | 405 | 500 | 445 | 565 | 520 / 590 / 550 |
+| Mesa Panfrost (RG-34XXSP) | 495 | 790 | 630 | 830 | 635 | 935 | 795 / 685 / 625 |
+
+At 5x5 and 6x6 the extra time of `-q normal` goes to sprite sheets and other images with hard edges (up to
+2.5 times the time on Panfrost, for 3 to 4 dB); photos take the same time as with `-q fast`.
 
 Time batches, not single images: the first dispatch of a run carries one-time costs. With the shader cache a
 repeat run of that batch takes about 1.1 s in all on the RG351P (2.9 s before, most of it compiling).

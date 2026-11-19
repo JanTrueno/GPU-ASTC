@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace gpuastc {
@@ -22,10 +23,10 @@ static uint32_t hash52(uint32_t p)
     return p;
 }
 
-// Group (0 or 1) of texel (x, y) of a 4x4 block for a two-partition seed.
-static int select_partition2(int seed, int x, int y)
+// Group (0 or 1) of texel (x, y) for a two-partition seed. small: the block has under 31 texels.
+static int select_partition2(int seed, int x, int y, bool small = true)
 {
-    x <<= 1; y <<= 1; // blocks under 31 texels
+    if (small) { x <<= 1; y <<= 1; }
     seed += 1024;     // (partition count - 1) * 1024
     const uint32_t r = hash52((uint32_t)seed);
     int s1 = r & 0xF, s2 = (r >> 4) & 0xF, s3 = (r >> 8) & 0xF, s4 = (r >> 12) & 0xF;
@@ -76,20 +77,133 @@ static std::vector<uint32_t> build_partition_table()
     return val;
 }
 
-static GLuint g_partition_tex = 0; // one per GL context, shared by every Encoder
-
-static GLuint partition_texture()
+// 5x5 and 6x6: a mask no longer fits a table index. The table is keyed by a 16-texel sample of
+// the wanted split (rows and columns 0,1,3,4 or 0,2,3,5) and names the three patterns closest on
+// that sample; the shader compares those three in full. Masks hold rows 0-2 in the first word
+// and the remaining rows in the second, dim bits per row.
+// 264 rows of 256: rows 0-255 seed0 | seed1 << 10 | seed2 << 20 by key, rows 256-263 the two mask
+// words of every seed.
+static std::vector<uint32_t> build_big_partition_table(int dim)
 {
-    if (!g_partition_tex) {
-        const std::vector<uint32_t> table = build_partition_table();
-        glGenTextures(1, &g_partition_tex);
-        glBindTexture(GL_TEXTURE_2D, g_partition_tex);
-        glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, 256, 256);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 256, GL_RED_INTEGER, GL_UNSIGNED_INT, table.data());
+    const bool small = dim * dim < 31;
+    const int sample[2][4] = {{0, 1, 3, 4}, {0, 2, 3, 5}};
+    const int* at = sample[dim == 5 ? 0 : 1];
+    const uint32_t all_lo = (1u << (3 * dim)) - 1, all_hi = (1u << ((dim - 3) * dim)) - 1;
+
+    std::vector<uint32_t> table(256 * 264, 0);
+    std::vector<uint64_t> seen;   // distinct splits so far (the smaller of a mask and its complement)
+    std::vector<uint16_t> seeds, sig;
+    for (int seed = 0; seed < 1024; ++seed) {
+        uint32_t lo = 0, hi = 0;
+        for (int y = 0; y < dim; ++y)
+            for (int x = 0; x < dim; ++x)
+                if (select_partition2(seed, x, y, small)) {
+                    if (y < 3) lo |= 1u << (dim * y + x);
+                    else       hi |= 1u << (dim * (y - 3) + x);
+                }
+        table[65536 + 2 * seed] = lo;
+        table[65536 + 2 * seed + 1] = hi;
+        if ((lo == 0 && hi == 0) || (lo == all_lo && hi == all_hi))
+            continue; // everything in one group
+        const uint64_t a = ((uint64_t)lo << 32) | hi, b = ((uint64_t)(lo ^ all_lo) << 32) | (hi ^ all_hi);
+        const uint64_t canon = a < b ? a : b;
+        bool dup = false;
+        for (uint64_t c : seen) if (c == canon) { dup = true; break; }
+        if (dup) continue; // the lowest seed of each distinct split
+        seen.push_back(canon);
+        uint32_t key = 0;
+        for (int r = 0; r < 4; ++r) {
+            const uint32_t row = at[r] < 3 ? lo >> (dim * at[r]) : hi >> (dim * (at[r] - 3));
+            for (int c = 0; c < 4; ++c)
+                key |= ((row >> at[c]) & 1u) << (4 * r + c);
+        }
+        seeds.push_back((uint16_t)seed);
+        sig.push_back((uint16_t)key);
+    }
+
+    // For every key the three smallest of distance * 2048 + position (nearest first, lowest
+    // seed on ties). A key and its complement have the same answer, so half the keys are scanned.
+    uint8_t bits[256]; // set bits of a byte: a table this small stays in the first-level cache
+    bits[0] = 0;
+    for (uint32_t i = 1; i < 256; ++i) bits[i] = (uint8_t)(bits[i >> 1] + (i & 1));
+    const uint16_t* const sg = sig.data();
+    const size_t n = seeds.size();
+    for (uint32_t key = 0; key < 32768; ++key) {
+        uint32_t best[3] = {~0u, ~0u, ~0u};
+        for (size_t i = 0; i < n; ++i) {
+            const uint32_t x = key ^ sg[i];
+            uint32_t d = (uint32_t)bits[x & 255] + bits[x >> 8];
+            if (d > 8) d = 16 - d;
+            const uint32_t v = d * 2048 + (uint32_t)i;
+            if (v >= best[2]) continue;
+            if (v < best[0])      { best[2] = best[1]; best[1] = best[0]; best[0] = v; }
+            else if (v < best[1]) { best[2] = best[1]; best[1] = v; }
+            else                  { best[2] = v; }
+        }
+        table[key] = table[key ^ 0xFFFFu] = (uint32_t)seeds[best[0] & 2047] | ((uint32_t)seeds[best[1] & 2047] << 10)
+                                          | ((uint32_t)seeds[best[2] & 2047] << 20);
+    }
+    return table;
+}
+
+// Building the 5x5 or 6x6 table takes 0.2 to 0.4 s on a handheld's CPU, so it is kept next to
+// the cached shaders. File: "GASTCTAB" (8 bytes), FNV-1a of the entries (8), the entries.
+static uint64_t table_hash(const std::vector<uint32_t>& t)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t v : t) { h ^= v; h *= 1099511628211ull; }
+    return h;
+}
+
+static std::vector<uint32_t> big_partition_table(int dim, const std::string& cache_dir)
+{
+    const size_t count = 256 * 264;
+    const std::string path = cache_dir.empty() ? std::string()
+                           : cache_dir + "/gpuastc-patterns-" + std::to_string(dim) + "x" + std::to_string(dim) + "-1.bin";
+    std::vector<uint32_t> table(count);
+    if (!path.empty()) {
+        if (FILE* f = std::fopen(path.c_str(), "rb")) {
+            uint8_t hdr[16];
+            uint64_t h = 0;
+            bool ok = std::fread(hdr, 1, sizeof(hdr), f) == sizeof(hdr) && std::memcmp(hdr, "GASTCTAB", 8) == 0
+                   && std::fread(table.data(), 4, count, f) == count;
+            std::fclose(f);
+            if (ok) {
+                std::memcpy(&h, hdr + 8, 8);
+                if (h == table_hash(table)) return table;
+            }
+        }
+    }
+    table = build_big_partition_table(dim);
+    if (!path.empty()) {
+        const std::string tmp = path + ".tmp";
+        if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+            const uint64_t h = table_hash(table);
+            const bool ok = std::fwrite("GASTCTAB", 1, 8, f) == 8 && std::fwrite(&h, 8, 1, f) == 1
+                         && std::fwrite(table.data(), 4, count, f) == count;
+            if (std::fclose(f) != 0 || !ok || std::rename(tmp.c_str(), path.c_str()) != 0)
+                std::remove(tmp.c_str());
+        }
+    }
+    return table;
+}
+
+static GLuint g_partition_tex[3] = {0, 0, 0}; // 4x4, 5x5, 6x6: one per GL context, shared by every Encoder
+
+static GLuint partition_texture(int block, const std::string& cache_dir)
+{
+    GLuint& tex = g_partition_tex[block - 4];
+    if (!tex) {
+        const std::vector<uint32_t> table = block == 4 ? build_partition_table() : big_partition_table(block, cache_dir);
+        const GLsizei rows = (GLsizei)(table.size() / 256);
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, 256, rows);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, rows, GL_RED_INTEGER, GL_UNSIGNED_INT, table.data());
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     }
-    return g_partition_tex;
+    return tex;
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +338,8 @@ bool Encoder::create(const Options& opt, std::string* log)
     if (opt.quality <= 0)
         src += "#define USE_PARTITIONS 0\n";
     else if (opt.quality >= 2)
-        src += "#define PART_CANDIDATES 3\n#define ALT_ERR_THRESHOLD 64.0\n";
+        src += "#define PART_CANDIDATES 3\n#define ALT_ERR_THRESHOLD 64.0\n"
+               "#define BIG_CANDIDATES 3\n#define BIG_ERR_THRESHOLD 32.0\n#define BIG_MAX_MISMATCH 5\n";
     // Tuning hook: GPUASTC_SHADER_DEFINES="NAME=VALUE;NAME=VALUE" overrides shader defaults
     // (ALT_ERR_THRESHOLD, PART_CANDIDATES, USE_PARTITIONS, ...).
     if (const char* extra = std::getenv("GPUASTC_SHADER_DEFINES")) {
@@ -297,8 +412,8 @@ bool Encoder::create(const Options& opt, std::string* log)
         save_cached_program(cached, program_);
     }
 
-    if (opt.block == 4 && opt.quality > 0)
-        partition_texture(); // built here so the first encode does not pay for it
+    if (opt.quality > 0 && (opt.block == 4 || !opt.alpha))
+        partition_texture(opt.block, opt.cache_dir); // built here so the first encode does not pay for it
     loc_tex_size_ = glGetUniformLocation(program_, "uTexSize");
     loc_blocks_ = glGetUniformLocation(program_, "uBlocks");
     loc_count_ = glGetUniformLocation(program_, "uN");
@@ -341,8 +456,8 @@ bool Encoder::dispatch(int width, int height, GLuint out_buffer)
     glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)bx * by * 16, nullptr, GL_DYNAMIC_COPY);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, out_buffer);
 
-    if (opt_.block == 4 && opt_.quality > 0) { // partition patterns, texture unit 1
-        const GLuint table = partition_texture();
+    if (opt_.quality > 0 && (opt_.block == 4 || !opt_.alpha)) { // partition patterns, texture unit 1
+        const GLuint table = partition_texture(opt_.block, opt_.cache_dir);
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, table);
         glActiveTexture(GL_TEXTURE0);

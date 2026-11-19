@@ -57,7 +57,14 @@ precision highp usampler2D;
 #define GRID_MODE 0
 #endif
 // the squared error of the first encoding is only worked out where something is compared with it
-#if BLOCK_DIM == 4 || GRID_MODE
+// two partitions for opaque 5x5 / 6x6 blocks; needs the pattern table texture (uPartLut)
+#if BLOCK_DIM != 4 && !HAS_ALPHA
+#define BIG_PARTITIONS USE_PARTITIONS
+#else
+#define BIG_PARTITIONS 0
+#endif
+
+#if BLOCK_DIM == 4 || GRID_MODE || BIG_PARTITIONS
 #define NEED_ERR 1
 #else
 #define NEED_ERR 0
@@ -102,6 +109,7 @@ precision highp usampler2D;
 #define MODE_4x4_Q2_DUAL 0x441u
 #define MODE_5x5_Q5  0x0F2u
 #define MODE_5x5_Q3  0x0F1u
+#define MODE_5x5_Q2  0x0E1u
 #define MODE_6x6_Q3  0x114u
 #define MODE_6x6_Q2  0x104u
 
@@ -140,10 +148,10 @@ layout(std430, binding = 1) readonly buffer InBuffer { uint pixels[]; };
 #else
 layout(binding = 0) uniform highp sampler2D uTex;
 #endif
-#if TWO_PARTITIONS
-// 256x256, R32UI: for every 16 bit "which side is each texel on" mask, the closest 2-partition
-// pattern the format offers: seed in bits 0-9, number of texels that differ in bits 10-14,
-// the pattern's own mask in bits 16-31.
+#if TWO_PARTITIONS || BIG_PARTITIONS
+// 4x4: 256x256, R32UI: for every 16 bit "which side is each texel on" mask, the closest
+// 2-partition pattern the format offers: seed in bits 0-9, number of texels that differ in bits
+// 10-14, the pattern's own mask in bits 16-31. 5x5 / 6x6: 256x264, see nearest_big().
 layout(binding = 1) uniform highp usampler2D uPartLut;
 #endif
 layout(std430, binding = 0) writeonly buffer OutBuffer { uvec4 blocks[]; };
@@ -364,7 +372,7 @@ vec4 eigen_vector4(vec3 xr, vec3 xg, vec4 xa)
 // Endpoints are stored with 8, 6 or 4 bits per channel; the decoder expands by bit replication.
 TV ep_quant(TV e, int bits)
 {
-    float qmax = (bits == 8) ? 255.0 : ((bits == 6) ? 63.0 : 15.0);
+    float qmax = (bits == 8) ? 255.0 : ((bits == 6) ? 63.0 : ((bits == 5) ? 31.0 : 15.0));
     return floor(clamp(e, 0.0, 255.0) * (qmax / 255.0) + 0.5);
 }
 
@@ -372,6 +380,7 @@ TV ep_unquant(TV q, int bits)
 {
     if (bits == 8) return q;
     if (bits == 6) return q * 4.0 + floor(q * (1.0 / 16.0));
+    if (bits == 5) return q * 8.0 + floor(q * (1.0 / 4.0));
     return q * 17.0;
 }
 
@@ -649,7 +658,7 @@ uvec4 encode_block(out float err, out float round_err, out bool opaque, out TV e
             float cc = dot(c, c);
 #endif
             scc += cc;
-#if TWO_PARTITIONS
+#if TWO_PARTITIONS || BIG_PARTITIONS
             // squared distance from the line (not the segment): the third colour of the block
 #if WEIGHTED
             float cd = dot(c, d);
@@ -754,7 +763,7 @@ void grid_row(vec4 w, out uint q4, out uint u8)
 }
 
 // best: the error to beat; the block is only packed (and true returned) when the grid is better.
-bool encode_grid(TV e0, TV e1, float best, out uvec4 blk)
+bool encode_grid(TV e0, TV e1, inout float best, out uvec4 blk)
 {
     TV d = e1 - e0;
     float dd = dot(d, d);
@@ -854,6 +863,7 @@ bool encode_grid(TV e0, TV e1, float best, out uvec4 blk)
     float err = scc - 2.0 * (a * r0 + b * swp) + a * a * al + 2.0 * a * b * be + b * b * ga;
     if (err >= best)
         return false; // skip the packing
+    best = err;
 
     uvec2 ws = uvec2(0u);
     for (int g = 0; g < 4; ++g)
@@ -878,28 +888,7 @@ bool encode_grid(TV e0, TV e1, float best, out uvec4 blk)
 }
 #endif
 
-// ---------------------------------------------------------------------------
-// two partitions (4x4 only)
-//
-// The texels are split in two groups, each with its own colour line, so a block with a hard edge
-// between two areas no longer has to put both on one line. The format only offers a fixed set of
-// split patterns; the table gives the closest one to a wanted split.
-// Storage: opaque RGB 6 bit endpoints + 3 weight levels; with alpha RGBA 4 bit + 4 levels.
-// ---------------------------------------------------------------------------
-
-#if TWO_PARTITIONS
-#ifndef PART_CANDIDATES
-#define PART_CANDIDATES 2 // candidate splits tried per block, 1-3
-#endif
-#ifndef PART_MAX_MISMATCH
-#define PART_MAX_MISMATCH 2 // skip a candidate split when the closest pattern differs in more texels than this
-#endif
-
-uint nearest_pattern(uint mask)
-{
-    return texelFetch(uPartLut, ivec2(int(mask & 255u), int((mask >> 8u) & 255u)), 0).r;
-}
-
+#if TWO_PARTITIONS || BIG_PARTITIONS
 // Endpoints of one group: opposite corners of its bounding box. Which corner each channel starts
 // from follows the sign of its covariance with the widest channel. Exact for two colours.
 // e0: the first endpoint as decoded, d: the step to the second.
@@ -930,6 +919,212 @@ void box_pair(TV mn, TV mx, TV s, float cnt, vec3 xr, int ebits, out TV e0, out 
     TV q0, q1;
     ep_pair(mix(mx, mn, up), mix(mn, mx, up), ebits, q0, q1, e0, d);
     d -= e0;
+}
+
+#endif
+
+// ---------------------------------------------------------------------------
+// two partitions for opaque 5x5 and 6x6 blocks
+//
+// Storage: 6 bit (5x5) or 5 bit (6x6) RGB endpoints and one weight bit per texel, so each group
+// is drawn with two colours. That suits what a single line with 3 to 5 weight levels does worst:
+// hard edges between flat areas (sprites, text, UI).
+// Masks hold rows 0-2 in .x and the remaining rows in .y, DIM bits per row.
+// ---------------------------------------------------------------------------
+
+#if BIG_PARTITIONS
+#ifndef BIG_ERR_THRESHOLD
+#define BIG_ERR_THRESHOLD 512.0 // squared error per texel above which the split is tried
+// (512: the blocks with hard edges that gain most; lower values add smaller gains on photos for
+// a lot more time)
+#endif
+#ifndef BIG_CANDIDATES
+#define BIG_CANDIDATES 2
+#endif
+#ifndef BIG_MAX_MISMATCH
+#define BIG_MAX_MISMATCH 3 // skip a split when the closest pattern differs in more texels than this
+#endif
+
+// Four of a row's texels: columns 0,1,3,4 (5x5) or 0,2,3,5 (6x6).
+uint sample4(uint r)
+{
+#if BLOCK_DIM == 5
+    return (r & 3u) | ((r >> 1u) & 12u);
+#else
+    return (r & 1u) | ((r >> 1u) & 6u) | ((r >> 2u) & 8u);
+#endif
+}
+
+// The pattern table. Rows 0-255: by a 16-texel sample of the wanted split (rows 0,1,3,4 or
+// 0,2,3,5 with sample4), the seeds of the three patterns closest on that sample, 10 bits each.
+// Rows 256-263: the two mask words of every seed. Returns the number of texels in which the
+// closest of the three differs from the wanted split m (either labelling).
+uint nearest_big(uvec2 m, out uint seed, out uvec2 pm)
+{
+#if BLOCK_DIM == 5
+    uint key = sample4(m.x) | (sample4(m.x >> 5u) << 4u) | (sample4(m.y) << 8u) | (sample4(m.y >> 5u) << 12u);
+#else
+    uint key = sample4(m.x) | (sample4(m.x >> 12u) << 4u) | (sample4(m.y) << 8u) | (sample4(m.y >> 12u) << 12u);
+#endif
+    uint e = texelFetch(uPartLut, ivec2(int(key & 255u), int(key >> 8u)), 0).r;
+    uint best = 99u;
+    seed = 0u;
+    pm = uvec2(0u);
+    for (int c = 0; c < 3; ++c)
+    {
+        uint sd = (e >> uint(10 * c)) & 1023u;
+        ivec2 at = ivec2(int((sd * 2u) & 255u), 256 + int(sd >> 7u));
+        uvec2 p = uvec2(texelFetch(uPartLut, at, 0).r, texelFetch(uPartLut, at + ivec2(1, 0), 0).r);
+        uint mm = uint(bitCount(p.x ^ m.x) + bitCount(p.y ^ m.y));
+        mm = min(mm, uint(BLOCK_SIZE) - mm);
+        if (mm < best)
+        {
+            best = mm;
+            seed = sd;
+            pm = p;
+        }
+    }
+    return best;
+}
+
+// One group whose texels each take one of two colours: the colours are the means of the two
+// sets (f0, f1 when a set is empty). n, s: count and colour sum of each set, qq: sum of t.t over
+// the group. Returns the squared error; flip: the pair had to be swapped to stay in stored order.
+float two_colours(float n0, vec3 s0, float n1, vec3 s1, float qq, vec3 f0, vec3 f1, int bits,
+                  out vec3 q0, out vec3 q1, out bool flip)
+{
+    q0 = ep_quant((n0 > 0.5) ? s0 / n0 : f0, bits);
+    q1 = ep_quant((n1 > 0.5) ? s1 / n1 : f1, bits);
+    vec3 u0 = ep_unquant(q0, bits);
+    vec3 u1 = ep_unquant(q1, bits);
+    float e = qq + dot(u0, n0 * u0 - 2.0 * s0) + dot(u1, n1 * u1 - 2.0 * s1);
+    flip = u0.r + u0.g + u0.b > u1.r + u1.g + u1.b;
+    if (flip)
+    {
+        vec3 t = q0; q0 = q1; q1 = t;
+    }
+    return e;
+}
+
+// best: the error to beat; the block is only packed (and true returned) when the split is better.
+bool encode_two_partitions_big(uint seed, uvec2 pm, inout float best, out uvec4 blk)
+{
+    const int ebits = (BLOCK_DIM == 5) ? 6 : 5;
+
+    // pass 1: bounding box, sums and covariance signs of both groups
+    vec3 mn0 = vec3(255.0), mx0 = vec3(0.0), mn1 = vec3(255.0), mx1 = vec3(0.0);
+    vec3 sa = vec3(0.0), s1 = vec3(0.0);
+    vec3 xra = vec3(0.0), xr1 = vec3(0.0); // r*g, r*b, g*b
+    float cnt1 = 0.0;
+    int i = 0;
+    for (int y = 0; i < uN; ++y)
+    {
+        uint rb = ((y < 3) ? pm.x : pm.y) >> uint(DIM * ((y < 3) ? y : y - 3));
+        for (int x = 0; x < DIM; ++x, ++i)
+        {
+            vec3 t = texel(i);
+            bool g = ((rb >> uint(x)) & 1u) != 0u;
+            float gf = float(g);
+            vec3 lo = min(g ? mn1 : mn0, t);
+            vec3 hi = max(g ? mx1 : mx0, t);
+            mn0 = g ? mn0 : lo; mn1 = g ? lo : mn1;
+            mx0 = g ? mx0 : hi; mx1 = g ? hi : mx1;
+            sa += t;
+            s1 += gf * t;
+            cnt1 += gf;
+            vec3 pr = vec3(t.r * t.gb, t.g * t.b);
+            xra += pr;
+            xr1 += gf * pr;
+        }
+    }
+    float cnt0 = float(BLOCK_SIZE) - cnt1;
+    vec3 e0, d0, e1, d1; // group 0 and group 1: first colour, step to the second
+    box_pair(mn0, mx0, sa - s1, cnt0, xra - xr1, ebits, e0, d0);
+    box_pair(mn1, mx1, s1, cnt1, xr1, ebits, e1, d1);
+    vec2 inv = 1.0 / max(vec2(dot(d0, d0), dot(d1, d1)), vec2(SMALL_VALUE));
+
+    // pass 2: every texel takes the nearer colour of its group. Sums over the texels with
+    // weight 1 (w), over those of group 1 with weight 1 (gw), and of t.t.
+    uvec2 ws = uvec2(0u);
+    vec3 sw = vec3(0.0), sgw = vec3(0.0);
+    float nw = 0.0, ngw = 0.0, qa = 0.0, qg = 0.0;
+    i = 0;
+    for (int y = 0; i < uN; ++y)
+    {
+        uint rb = ((y < 3) ? pm.x : pm.y) >> uint(DIM * ((y < 3) ? y : y - 3));
+        uint rw = 0u;
+        for (int x = 0; x < DIM; ++x, ++i)
+        {
+            vec3 t = texel(i);
+            bool g = ((rb >> uint(x)) & 1u) != 0u;
+            float gf = float(g);
+            bool w = dot(t - (g ? e1 : e0), g ? d1 : d0) * (g ? inv.y : inv.x) > 0.5;
+            float wf = float(w);
+            float tt = dot(t, t);
+            rw |= uint(w) << uint(x);
+            sw += wf * t;
+            sgw += (gf * wf) * t;
+            nw += wf;
+            ngw += gf * wf;
+            qa += tt;
+            qg += gf * tt;
+        }
+        put2(ws, uint(DIM * y), rw);
+    }
+
+    vec3 q0, q1, q2, q3;
+    bool flip0, flip1;
+    float err = two_colours(cnt0 - (nw - ngw), (sa - s1) - (sw - sgw), nw - ngw, sw - sgw, qa - qg,
+                            e0, e0 + d0, ebits, q0, q1, flip0)
+              + two_colours(cnt1 - ngw, s1 - sgw, ngw, sgw, qg, e1, e1 + d1, ebits, q2, q3, flip1);
+    if (err >= best)
+        return false; // most splits lose: skip the packing
+    best = err;
+
+    // a swapped pair: the weights of that group's texels change sides. The pattern as one bit
+    // per texel in texel order, like the weights:
+    uvec2 g1 = uvec2(pm.x | (pm.y << uint(3 * DIM)), pm.y >> uint(32 - 3 * DIM));
+    const uvec2 all = uvec2((BLOCK_SIZE >= 32) ? 0xFFFFFFFFu : ((1u << uint(BLOCK_SIZE & 31)) - 1u),
+                            (BLOCK_SIZE > 32) ? ((1u << uint(BLOCK_SIZE - 32)) - 1u) : 0u);
+    if (flip0) ws ^= all ^ g1;
+    if (flip1) ws ^= g1;
+
+    // block mode, partition count - 1, seed, 2 bits "same endpoint type for both", endpoint type
+    blk = uvec4(0u);
+#if BLOCK_DIM == 5
+    blk.x = MODE_5x5_Q2;
+#else
+    blk.x = MODE_6x6_Q2;
+#endif
+    blk.x |= (1u << 11u) | (seed << 13u) | (CEM_LDR_RGB_DIRECT << 25u);
+    uint pos = 29u;
+    put_endpoints(blk, pos, q0, q1, ebits, false);
+    put_endpoints(blk, pos, q2, q3, ebits, false);
+    put_weights(blk, ws);
+    return true;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// two partitions (4x4 only)
+//
+// The texels are split in two groups, each with its own colour line, so a block with a hard edge
+// between two areas no longer has to put both on one line. The format only offers a fixed set of
+// split patterns; the table gives the closest one to a wanted split.
+// Storage: opaque RGB 6 bit endpoints + 3 weight levels; with alpha RGBA 4 bit + 4 levels.
+// ---------------------------------------------------------------------------
+
+#if TWO_PARTITIONS
+#ifndef PART_CANDIDATES
+#define PART_CANDIDATES 2 // candidate splits tried per block, 1-3
+#endif
+#ifndef PART_MAX_MISMATCH
+#define PART_MAX_MISMATCH 2 // skip a candidate split when the closest pattern differs in more texels than this
+#endif
+
+uint nearest_pattern(uint mask)
+{
+    return texelFetch(uPartLut, ivec2(int(mask & 255u), int((mask >> 8u) & 255u)), 0).r;
 }
 
 // Two passes over the block, both groups at once: the bounding boxes, then the weights and the
@@ -1218,6 +1413,56 @@ void main()
         {
             blocks[index] = blk;
             err = e2;
+        }
+    }
+#endif
+#if BIG_PARTITIONS
+    if (err > BIG_ERR_THRESHOLD * float(BLOCK_SIZE))
+    {
+        // As at 4x4: the texels are sorted by which of three colours they are nearest to (the
+        // two endpoints and the texel farthest off their line); each group against the rest is
+        // a candidate split.
+        vec3 third = texel(far);
+        uvec2 gy = uvec2(0u), gz = uvec2(0u); // nearest to e1, nearest to the third colour
+        int i = 0;
+        for (int y = 0; i < uN; ++y)
+        {
+            uvec2 rb = uvec2(0u);
+            for (int x = 0; x < DIM; ++x, ++i)
+            {
+                vec3 t = texel(i);
+                vec3 d0 = t - e0, d1 = t - e1, d2 = t - third;
+                float l0 = dot(d0, d0), l1 = dot(d1, d1), l2 = dot(d2, d2);
+                bool z = l2 < min(l0, l1);
+                bool yb = !z && l1 < l0;
+                rb |= uvec2(uint(yb), uint(z)) << uint(x);
+            }
+            rb <<= uint(DIM * ((y < 3) ? y : y - 3));
+            if (y < 3) { gy.x |= rb.x; gz.x |= rb.y; }
+            else       { gy.y |= rb.x; gz.y |= rb.y; }
+        }
+        const uvec2 rows = uvec2((1u << uint(3 * DIM)) - 1u, (1u << uint((DIM - 3) * DIM)) - 1u);
+        uvec3 seed;
+        uvec2 pz, px, py;
+        uvec3 miss = uvec3(nearest_big(gz, seed.x, pz), nearest_big(rows ^ gy ^ gz, seed.y, px), nearest_big(gy, seed.z, py));
+        // try the closest fits first
+        for (int k = 0; k < BIG_CANDIDATES; ++k)
+        {
+            uint best = min(miss.x, min(miss.y, miss.z));
+            if (best > uint(BIG_MAX_MISMATCH))
+                break;
+            uint sd;
+            uvec2 pm;
+            if (miss.x == best)      { sd = seed.x; pm = pz; miss.x = 99u; }
+            else if (miss.y == best) { sd = seed.y; pm = px; miss.y = 99u; }
+            else                     { sd = seed.z; pm = py; miss.z = 99u; }
+            // the same pattern can be the closest to more than one split
+            if (seed.x == sd) miss.x = 99u;
+            if (seed.y == sd) miss.y = 99u;
+            if (seed.z == sd) miss.z = 99u;
+            uvec4 blk;
+            if (encode_two_partitions_big(sd, pm, err, blk))
+                blocks[index] = blk;
         }
     }
 #endif
