@@ -37,7 +37,8 @@ the free memory, 64 to 768), `-cache DIR` / `-nocache` where compiled shaders ar
   with alpha), 8-bit endpoints refitted to the chosen weights; flat blocks become constant-colour blocks;
   opaque blocks of an alpha texture are stored as RGB. 4x4 blocks that one colour line fits badly also try
   two partitions (`-q normal`, the default; `-q best` tries more, `-q fast` none) and, with alpha, a
-  dual-plane mode (exact for "transparent + two colours" pixel art).
+  dual-plane mode (exact for "transparent + two colours" pixel art). Smooth opaque 5x5 and 6x6 blocks
+  also try a 4x4 grid of 12-level weights and keep whichever has the lower error.
 
 ## Build
 
@@ -52,13 +53,13 @@ SDL_VIDEODRIVER=offscreen ./build/gpuastc in.png out.astc -v
 Two partitions only exist for 4x4, and three or four are not implemented, so blocks with four or more
 unrelated colours (and hard edges at 5x5 / 6x6) still look worse than astcenc. On a mixed set of photos,
 screenshots and sprites, 4x4 lands about 3 dB under astcenc's fast preset (2 to 6 dB per image), 5x5 and
-6x6 about 5 dB. Very smooth gradients at 6x6 get only 3 weight levels and can band slightly.
+6x6 about 4 dB.
 
-Measured on Mali-G31 (1 Mpx images, upload + encode + readback): 5x5 and 6x6 take 60 to 70 ms, 4x4 takes
-70 ms with `-q fast` and 80 to 100 ms with `-q normal` on Arm's driver. On Panfrost the two-partition
+Measured on Mali-G31 (1 Mpx images, upload + encode + readback): 5x5 and 6x6 take 55 to 95 ms, 4x4 takes
+55 to 70 ms with `-q fast` and 75 to 100 ms with `-q normal` on Arm's driver. On Panfrost the two-partition
 search is much slower (120 to 200 ms); use `-q fast` there if speed matters more.
 `GPUASTC_SHADER_DEFINES="NAME=VALUE;..."` overrides the shader's tuning defines (`ALT_ERR_THRESHOLD`,
-`PART_CANDIDATES`, `PART_MAX_MISMATCH`) for experiments.
+`PART_CANDIDATES`, `PART_MAX_MISMATCH`, `GRID_SMOOTH`, `GRID_ERR_THRESHOLD`, `USE_GRID`) for experiments.
 
 ## Tests
 

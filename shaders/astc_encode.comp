@@ -11,6 +11,7 @@
 //   6x6:  3 weight levels (2 for blocks with alpha)
 // Endpoints are 8 bit. A block of an alpha texture that is in fact opaque is stored as RGB.
 // 4x4 blocks that one colour line fits badly also try two partitions (and, with alpha, two planes).
+// Opaque 5x5 and 6x6 blocks also try a 4x4 grid of 12-level weights, which suits smooth gradients.
 
 precision highp float;
 precision highp int;
@@ -42,6 +43,21 @@ precision highp usampler2D;
 #else
 #define TWO_PARTITIONS 0
 #define DUAL_PLANE 0
+#endif
+
+#ifndef USE_GRID
+#define USE_GRID 1
+#endif
+#if BLOCK_DIM != 4 && !HAS_ALPHA
+#define GRID_MODE USE_GRID
+#else
+#define GRID_MODE 0
+#endif
+// the squared error of the first encoding is only worked out where something is compared with it
+#if BLOCK_DIM == 4 || GRID_MODE
+#define NEED_ERR 1
+#else
+#define NEED_ERR 0
 #endif
 
 #define SMALL_VALUE 0.00001
@@ -91,6 +107,22 @@ precision highp usampler2D;
 // Sum of squared error over a block above which the more expensive encodings are tried.
 #ifndef ALT_ERR_THRESHOLD
 #define ALT_ERR_THRESHOLD 256.0
+#endif
+// The dual-plane check is cheap next to the partition search and catches "transparent + two
+// colours" blocks whose single-plane error is small in absolute terms, so it starts earlier.
+#ifndef DUAL_ERR_THRESHOLD
+#define DUAL_ERR_THRESHOLD 16.0
+#endif
+// 5x5 / 6x6: the 4x4 weight grid is tried when rounding the weights to their few levels costs
+// more squared error than this. Blocks of hard edges round to the ends of the line for free and
+// skip it.
+#ifndef GRID_ERR_THRESHOLD
+#define GRID_ERR_THRESHOLD 20.0
+#endif
+// ... and only for smooth blocks: the squared weight steps between horizontal neighbours, as a
+// share of the weights' spread. A ramp across the block is about 0.3, noise about 1.7.
+#ifndef GRID_SMOOTH
+#define GRID_SMOOTH 0.4
 #endif
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -177,7 +209,7 @@ uint trit_group_bits(uint grp, uint nb)
 
 // Weight index (0 = endpoint 0 ... levels-1 = endpoint 1) -> stored value, and -> the weight the
 // decoder uses (0..1). q12 picks between the two 4x4 ranges; 5x5 and 6x6 have one range each.
-#if BLOCK_DIM == 4
+#if BLOCK_DIM == 4 || GRID_MODE
 uint scramble_weight(uint q, bool q12)
 {
     if (q12)
@@ -418,7 +450,7 @@ void put2(inout uvec2 o, uint pos, uint v)
 // Returns the stored endpoints (e0, e1), the squared error and the texel farthest off the line.
 // ---------------------------------------------------------------------------
 
-uvec4 encode_block(out float err, out bool opaque, out TV e0, out TV e1, out int far)
+uvec4 encode_block(out float err, out float round_err, out bool opaque, out TV e0, out TV e1, out int far)
 {
     // pass 1. Moments are taken relative to the first texel: sums of products of raw 0..255
     // values would lose the low bits that the covariance of a smooth block lives in.
@@ -443,6 +475,7 @@ uvec4 encode_block(out float err, out bool opaque, out TV e0, out TV e1, out int
     }
 
     err = 0.0;
+    round_err = 0.0;
     far = 0;
     e0 = ref;
     e1 = ref;
@@ -526,9 +559,13 @@ uvec4 encode_block(out float err, out bool opaque, out TV e0, out TV e1, out int
     S2 sww = S2(0.0);
     S2 sp = S2(0.0);
     S2 swp = S2(0.0);
-#if BLOCK_DIM == 4
+#if NEED_ERR
     S2 scc = S2(0.0);
     float worst = -1.0;
+#endif
+#if GRID_MODE
+    float wprev = 0.0, rough = 0.0, siw = 0.0, siww = 0.0; // previous weight, sum of squared steps, sums of w and w*w
+    int col = 0;
 #endif
 #if WEIGHTED
     vec2 nn = vec2(0.0, n);
@@ -550,7 +587,13 @@ uvec4 encode_block(out float err, out bool opaque, out TV e0, out TV e1, out int
             const float om = 1.0;
             float pc = dot(c, d);
 #endif
-            float w = clamp(SUM2(pc) * inv, 0.0, 1.0);
+#if WEIGHTED
+            // least-squares weight under the same per-channel weights (a transparent texel is
+            // placed by its alpha alone)
+            float w = clamp(SUM2(pc) / max(dot(om, dd), SMALL_VALUE), 0.0, 1.0);
+#else
+            float w = clamp(pc * inv, 0.0, 1.0);
+#endif
             uint q = uint(w * wmax + 0.5);
 #if BLOCK_DIM == 4
             float wu = unquant_weight(q, q12);
@@ -558,11 +601,19 @@ uvec4 encode_block(out float err, out bool opaque, out TV e0, out TV e1, out int
 #else
             float wu = float(q) * (1.0 / wmax);
 #endif
+#if GRID_MODE
+            round_err += (w - wu) * (w - wu);
+            if (col != 0) rough += (w - wprev) * (w - wprev);
+            col = (col == DIM - 1) ? 0 : col + 1;
+            wprev = w;
+            siw += w;
+            siww += w * w;
+#endif
             sw += wu * om;
             sww += wu * wu * om;
             sp += pc;
             swp += wu * pc;
-#if BLOCK_DIM == 4
+#if NEED_ERR
 #if WEIGHTED
             vec2 cc = om * vec2(dot(c.rgb, c.rgb), c.a * c.a);
 #else
@@ -630,8 +681,12 @@ uvec4 encode_block(out float err, out bool opaque, out TV e0, out TV e1, out int
             b = 1.0;
         }
     }
-#if BLOCK_DIM == 4
+#if NEED_ERR
     err = SUM2(scc) - 2.0 * (a * r0 + b * r1) + a * a * al + 2.0 * a * b * be + b * b * ga;
+#endif
+#if GRID_MODE
+    // not smooth: the grid cannot follow it, do not try
+    round_err = (rough > GRID_SMOOTH * (siww - siw * siw / n)) ? 0.0 : round_err * dd;
 #endif
 
     uvec4 blk = uvec4(0u);
@@ -641,6 +696,151 @@ uvec4 encode_block(out float err, out bool opaque, out TV e0, out TV e1, out int
     put_weights(blk, ws);
     return blk;
 }
+
+// ---------------------------------------------------------------------------
+// 4x4 weight grid for 5x5 and 6x6 blocks (opaque only)
+//
+// One weight per texel leaves 5x5 with 5 weight levels and 6x6 with 3. A block that is one smooth
+// gradient is better served by 16 weights of 12 levels that the decoder interpolates across the
+// block. Two passes: the grid weights, then the texels as the decoder will rebuild them, which
+// gives the refit sums and the error that decides between the two encodings.
+// ---------------------------------------------------------------------------
+
+#if GRID_MODE
+// Wanted weight of grid cell i: the projection of the texels around it onto the endpoint line.
+float grid_weight(int i, TV e0, TV dn)
+{
+    int gx = i & 3;
+    int gy = i >> 2;
+#if BLOCK_DIM == 6
+    // cell (gx, gy) covers texels x0..x0+1, y0..y0+1 with x0, y0 in {0,1,3,4}; the nearer the
+    // texel the larger its share (4/9, 2/9, 2/9, 1/9)
+    int x0 = gx + (gx >> 1);
+    int y0 = gy + (gy >> 1);
+    int px = gx & 1; // odd cells: the first tap is the far one
+    int py = gy & 1;
+    int base = y0 * 6 + x0;
+    vec2 fx = (px == 0) ? vec2(2.0, 1.0) : vec2(1.0, 2.0);
+    vec2 fy = (py == 0) ? vec2(2.0, 1.0) : vec2(1.0, 2.0);
+    return (dot(dn, texel(base) - e0)     * (fx.x * fy.x)
+          + dot(dn, texel(base + 1) - e0) * (fx.y * fy.x)
+          + dot(dn, texel(base + 6) - e0) * (fx.x * fy.y)
+          + dot(dn, texel(base + 7) - e0) * (fx.y * fy.y)) * (1.0 / 9.0);
+#else
+    // grid cell g sits at texel coordinate g * 4/3: x0 = floor, fraction in thirds
+    int x0 = min((gx * 4) / 3, 3);
+    int y0 = min((gy * 4) / 3, 3);
+    float fx = float(gx * 4 - 3 * x0) * (1.0 / 3.0);
+    float fy = float(gy * 4 - 3 * y0) * (1.0 / 3.0);
+    int base = y0 * 5 + x0;
+    return dot(dn, texel(base) - e0)     * ((1.0 - fx) * (1.0 - fy))
+         + dot(dn, texel(base + 1) - e0) * (fx * (1.0 - fy))
+         + dot(dn, texel(base + 5) - e0) * ((1.0 - fx) * fy)
+         + dot(dn, texel(base + 6) - e0) * (fx * fy);
+#endif
+}
+
+// Grid weight k as the decoder sees it, 0..64 (gu: one byte per weight).
+float grid_value(uvec4 gu, int k)
+{
+    k = min(k, 15);
+    return float((gu[k >> 2] >> uint(8 * (k & 3))) & 255u);
+}
+
+uvec4 encode_grid(TV e0, TV e1, out float err)
+{
+    TV d = e1 - e0;
+    float dd = dot(d, d);
+    float inv = 1.0 / max(dd, SMALL_VALUE);
+
+    // pass 1: the 16 grid weights. gq: the stored index, 4 bits each; gu: the decoder's value
+    uvec2 gq = uvec2(0u);
+    uvec4 gu = uvec4(0u);
+    int cells = min(uN, 16); // 16, but not a compile-time constant: keeps the loop rolled
+    for (int i = 0; i < cells; ++i)
+    {
+        uint q = uint(clamp(grid_weight(i, e0, d * inv), 0.0, 1.0) * 11.0 + 0.5);
+        gu[i >> 2] |= uint(unquant_weight(q, true) * 64.0 + 0.5) << uint(8 * (i & 3));
+        q <<= uint(4 * (i & 7));
+        if (i < 8) gq.x |= q; else gq.y |= q;
+    }
+
+    // pass 2: every texel with the weight the decoder interpolates for it (ASTC weight infill)
+    float sw = 0.0, sww = 0.0, sp = 0.0, swp = 0.0, scc = 0.0;
+    for (int i = 0; i < uN; ++i)
+    {
+        int y = i / DIM;
+        int x = i - y * DIM;
+        // position in the grid in 1/16 cells: scale = (1024 + DIM / 2) / (DIM - 1), 3 = grid size - 1
+        ivec2 g = (ivec2(x, y) * (3 * ((1024 + DIM / 2) / (DIM - 1))) + 32) >> 6;
+        ivec2 j = g >> 4;
+        ivec2 f = g & 15;
+        int k = j.y * 4 + j.x;
+        int w11 = (f.x * f.y + 8) >> 4;
+        float wu = floor((grid_value(gu, k)     * float(16 - f.x - f.y + w11)
+                        + grid_value(gu, k + 1) * float(f.x - w11)
+                        + grid_value(gu, k + 4) * float(f.y - w11)
+                        + grid_value(gu, k + 5) * float(w11) + 8.0) * (1.0 / 16.0)) * (1.0 / 64.0);
+        TV c = texel(i) - e0;
+        float pc = dot(c, d);
+        sw += wu;
+        sww += wu * wu;
+        sp += pc;
+        swp += wu * pc;
+        scc += dot(c, c);
+    }
+
+    // refit along the line and error, as in encode_block
+    float n = float(BLOCK_SIZE);
+    float al = dd * (n - 2.0 * sw + sww);
+    float be = dd * (sw - sww);
+    float ga = dd * sww;
+    float r0 = sp - swp;
+    float det = al * ga - be * be;
+    float a = 0.0;
+    float b = 1.0;
+    if (det > 1e-4 * (al + ga) * (al + ga))
+    {
+        a = (ga * r0 - be * swp) / det;
+        b = (al * swp - be * r0) / det;
+        TV n0 = ep_quant(e0 + a * d, 8);
+        TV n1 = ep_quant(e0 + b * d, 8);
+        TV dn = n1 - n0;
+        if (dn.r + dn.g + dn.b >= 0.0)
+        {
+            e0 = n0;
+            e1 = n1;
+        }
+        else
+        {
+            a = 0.0;
+            b = 1.0;
+        }
+    }
+    err = scc - 2.0 * (a * r0 + b * swp) + a * a * al + 2.0 * a * b * be + b * b * ga;
+
+    uvec2 ws = uvec2(0u);
+    for (int g = 0; g < 4; ++g)
+    {
+        uint grp = 0u;
+        for (int m = 0; m < 5; ++m)
+        {
+            int i = g * 5 + m;
+            if (i >= cells)
+                break;
+            uint q = (((i < 8) ? gq.x : gq.y) >> uint(4 * (i & 7))) & 15u;
+            grp |= scramble_weight(q, true) << uint(4 * m);
+        }
+        put2(ws, uint(g) * 18u, trit_group_bits(grp, 2u));
+    }
+    uvec4 blk = uvec4(0u);
+    blk.x = MODE_4x4_Q12 | (CEM_LDR_RGB_DIRECT << 13u);
+    uint pos = 17u;
+    put_endpoints(blk, pos, e0, e1, 8, false);
+    put_weights(blk, ws);
+    return blk;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // two partitions (4x4 only)
@@ -914,16 +1114,25 @@ void main()
     g_origin = b * DIM;
     int index = b.y * uBlocks.x + b.x;
 
-    float err;
+    float err, round_err;
     bool opaque;
     TV e0, e1;
     int far;
     // Written first so the single-plane state is dead before the other searches start
     // (this lowers register use).
-    blocks[index] = encode_block(err, opaque, e0, e1, far);
+    blocks[index] = encode_block(err, round_err, opaque, e0, e1, far);
 
+#if GRID_MODE
+    if (round_err > GRID_ERR_THRESHOLD)
+    {
+        float e2;
+        uvec4 blk = encode_grid(e0, e1, e2);
+        if (e2 < err)
+            blocks[index] = blk;
+    }
+#endif
 #if DUAL_PLANE
-    if (!opaque && err > ALT_ERR_THRESHOLD)
+    if (!opaque && err > DUAL_ERR_THRESHOLD)
     {
         float e2;
         uvec4 blk = encode_dual_plane(e2);
