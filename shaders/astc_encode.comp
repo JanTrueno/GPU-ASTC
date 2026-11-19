@@ -109,7 +109,7 @@ precision highp usampler2D;
 
 // Sum of squared error over a block above which the more expensive encodings are tried.
 #ifndef ALT_ERR_THRESHOLD
-#define ALT_ERR_THRESHOLD 256.0
+#define ALT_ERR_THRESHOLD 1024.0
 #endif
 // The dual-plane check is cheap next to the partition search and catches "transparent + two
 // colours" blocks whose single-plane error is small in absolute terms, so it starts earlier.
