@@ -44,8 +44,7 @@ static int select_partition2(int seed, int x, int y, bool small = true)
 static std::vector<uint32_t> build_partition_table()
 {
     std::vector<uint32_t> val(65536, 0);
-    std::vector<uint8_t> dist(65536, 255);
-    std::vector<uint32_t> frontier, next;
+    std::vector<uint8_t> dist(65536, 99);
     for (int seed = 1023; seed >= 0; --seed) { // lowest seed wins
         uint32_t mask = 0;
         for (int i = 0; i < 16; ++i)
@@ -53,24 +52,25 @@ static std::vector<uint32_t> build_partition_table()
         if (mask == 0 || mask == 0xFFFF)
             continue; // everything in one group
         for (uint32_t m : {mask, mask ^ 0xFFFFu}) {
-            if (dist[m] != 0) frontier.push_back(m);
             dist[m] = 0;
             val[m] = (uint32_t)seed | (mask << 16);
         }
     }
-    // breadth-first over single texel flips: every mask gets its nearest pattern
-    for (uint8_t d = 1; !frontier.empty(); ++d) {
-        next.clear();
-        for (uint32_t m : frontier)
-            for (int b = 0; b < 16; ++b) {
+    // Every other mask takes the pattern of a neighbour (one texel flipped) that is closer to
+    // one, texel by texel, until nothing changes. Which of several equally close patterns a
+    // mask ends up with depends on this order; of the orders tried this one scored best by a
+    // small margin, and tests/partition_lut.py builds the table the same way.
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (int b = 0; b < 16; ++b)
+            for (uint32_t m = 0; m < 65536; ++m) {
                 const uint32_t n = m ^ (1u << b);
-                if (dist[n] == 255) {
-                    dist[n] = d;
-                    val[n] = val[m];
-                    next.push_back(n);
+                if (dist[n] + 1 < dist[m]) {
+                    dist[m] = (uint8_t)(dist[n] + 1);
+                    val[m] = val[n];
+                    changed = true;
                 }
             }
-        frontier.swap(next);
     }
     for (int m = 0; m < 65536; ++m)
         val[m] |= (uint32_t)dist[m] << 10;
