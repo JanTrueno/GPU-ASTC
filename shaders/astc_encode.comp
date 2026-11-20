@@ -140,6 +140,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 uniform ivec2 uTexSize;   // source size in texels
 uniform ivec2 uBlocks;    // size in blocks
+uniform int uRow0;        // first block row of this dispatch (big images are encoded in bands)
 uniform int uN;           // BLOCK_SIZE (non-constant so loops are not unrolled)
 #if INPUT_BUFFER
 // Uploading a texture is slow on some drivers (Mali: 35-40 ms per megapixel, more than encoding
@@ -1385,7 +1386,7 @@ uvec4 encode_dual_plane(out float err)
 
 void main()
 {
-    ivec2 b = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 b = ivec2(gl_GlobalInvocationID.xy) + ivec2(0, uRow0);
     if (b.x >= uBlocks.x || b.y >= uBlocks.y)
         return;
     g_origin = b * DIM;
