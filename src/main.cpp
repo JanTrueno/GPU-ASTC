@@ -1084,6 +1084,15 @@ int main(int argc, char** argv)
         std::printf("%s: written in %.2f ms (GPU %.2f ms)\n", files[0].second.c_str(), wall, gpu.ms_gpu);
     }
 
+    // Everything is written and synced: leave without taking the GL context down. PowerVR's driver
+    // (GE8300, TrimUI Smart Pro) spends 2 to 6 s releasing the context of the 4x4 shader, several
+    // times the conversion itself. GPUASTC_EXIT=clean releases everything in order (leak checkers).
+    const char* how = std::getenv("GPUASTC_EXIT");
+    if (!how || std::strcmp(how, "clean")) {
+        std::fflush(stdout);
+        std::fflush(stderr);
+        _exit((gpu.files_failed || !pack_ok) ? 1 : 0);
+    }
     gpu.encoders.clear();
     glDeleteBuffers(1, &gpu.buf);
     glDeleteTextures(1, &gpu.tex);

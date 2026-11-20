@@ -8,7 +8,8 @@ It also runs on desktop Linux (Mesa, llvmpipe), and its output decodes correctly
 Checked by decoding what each device wrote and comparing it with the desktop result: Mali-G31 (Arm's driver
 and Mesa Panfrost), Mali-T860 (Arm r18), Adreno 650 (Mesa freedreno) and PowerVR Rogue GE8300. The `-upload`
 self-test only shows that the GPU accepts the blocks; on a new driver also decode a result and look at it,
-two of those five needed a fix that the self-test did not show.
+two of those five needed a fix that the self-test did not show (`tests/device_encode.sh` on the device,
+then `tests/device_score.py` on a PC).
 
 ## Usage
 
@@ -37,11 +38,13 @@ the free memory, 64 to 768), `-cache DIR` / `-nocache` where compiled shaders ar
   common variants takes about 2 s per run, loading them 0.03 s.
 - **Archive:** `include/astcpak.h` is a header-only C/C++ reader for games you can modify
   (`astcpak_open`, `astcpak_find`, `astcpak_gl_format`). Layout is documented at the top of the header.
-- **Encoder:** one weight per texel at every block size (4x4: 12 levels, 5x5: 5, 6x6: 3; fewer for blocks
-  with alpha), 8-bit endpoints refitted to the chosen weights; flat blocks become constant-colour blocks;
-  opaque blocks of an alpha texture are stored as RGB. 4x4 blocks that one colour line fits badly also try
-  two partitions (`-q normal`, the default; `-q best` tries more, `-q fast` none) and, with alpha, a
-  dual-plane mode (exact for "transparent + two colours" pixel art). Smooth opaque 5x5 and 6x6 blocks
+- **Encoder:** one weight per texel at every block size (4x4: 12 levels, 10 with alpha, 16 for grey blocks;
+  5x5: 5, 6x6: 3; fewer for 5x5 / 6x6 blocks with alpha), endpoints refitted to the chosen weights; flat
+  blocks become constant-colour blocks; opaque blocks of an alpha texture are stored as RGB and grey 4x4
+  blocks as luminance (+ alpha), which leaves more bits for the weights. 4x4 blocks that one colour line
+  fits badly also try two partitions (`-q normal`, the default; `-q best` tries more, `-q fast` none) and,
+  with alpha, two dual-plane encodings: "two colours, two alpha values" (exact for pixel art) and colour
+  and alpha each with their own graded weights (soft alpha edges). Smooth opaque 5x5 and 6x6 blocks
   also try a 4x4 grid of 12-level weights and keep whichever has the lower error. Opaque 5x5 and 6x6
   blocks with a large error try two partitions too, with two colours per partition: `-q normal` only
   where the error is very large (hard edges: sprites, text, UI), `-q best` on many more blocks,
@@ -60,7 +63,13 @@ SDL_VIDEODRIVER=offscreen ./build/gpuastc in.png out.astc -v
 Three or four partitions are not implemented, and at 5x5 / 6x6 a partition holds two colours without
 steps between them, so blocks with many unrelated colours still look worse than astcenc. On a mixed set of photos,
 screenshots and sprites, 4x4, 5x5 and 6x6 each land about 3 dB under astcenc's fast preset (2 to 6 dB
-per image).
+per image); on watercolour art with soft alpha 4x4 is about 4 dB under it.
+
+Against astcenc on the CPU (5.3, NEON, four Cortex-A55 cores, RG-34XXSP, 4x4, whole run): twelve 1 Mpx
+images take astcenc 4.4 s at `-fastest` and 6.1 s at `-fast`, this encoder 1.25 s (`-q fast` 0.9 s); six
+textures that are mostly soft alpha take 2.5 s and 3.8 s against 1.6 s. astcenc's result is better even at
+`-fastest`, by 1.5 to 3 dB. So this is the tool when the time on the device counts most; when quality
+counts most, astcenc `-fastest` on the CPU costs 1.5 to 3.5 times the time.
 
 Measured on Mali-G31 with a batch of 12 images of 1 Mpx (photo, sprite sheets, screenshot), GPU time for
 upload + encode + readback in ms, against the encoder this one started from:
@@ -72,6 +81,18 @@ upload + encode + readback in ms, against the encoder this one started from:
 
 At 5x5 and 6x6 the extra time of `-q normal` goes to sprite sheets and other images with hard edges (up to
 2.5 times the time on Panfrost, for 3 to 4 dB); photos take the same time as with `-q fast`.
+
+The 4x4 columns are from before the grey and soft-alpha modes. With them, 4x4 GPU ms for those 12 mixed
+images / for 6 textures that are mostly soft alpha (old encoder in brackets):
+
+| | `-q fast` | `-q normal` |
+|---|---|---|
+| Mali-G31, Panfrost (RG-34XXSP) | 550 / 545 (770 / 820) | 845 / 1350 |
+| Mali-T860, Arm r18 (RG552) | 152 / 168 (192 / 128) | 253 / 260 |
+| Adreno 650, freedreno (Retroid Pocket 5) | 23 / 18 (53 / 36) | 36 / 55 |
+| PowerVR GE8300 (TrimUI Smart Pro) | 320 / 259 (635 / 370) | 460 / 488 |
+
+Soft alpha is where `-q normal` costs most: half of that time is the partition search on blocks with alpha.
 
 Time batches, not single images: the first dispatch of a run carries one-time costs. With the shader cache a
 repeat run of that batch takes about 1.1 s in all on the RG351P (2.9 s before, most of it compiling).
